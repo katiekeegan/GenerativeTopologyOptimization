@@ -1,0 +1,11 @@
+# Ignore __pycache__ folders
+__pycache__/
+
+# Ignore the 'data' folder
+data/
+
+# Ignore the 'sphere_complex' folder
+sphere_complex/
+utils/sphere_complex
+*.obj
+*.pth

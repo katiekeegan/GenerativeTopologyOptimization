@@ -3,258 +3,186 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from dl4to.datasets import SELTODataset
 
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+import numpy as np
 
-def generate_query_points(surface_points, num_query_points=1000, noise_std=0.05):
-    """
-    Generate query points around the surface points.
-    
-    Args:
-        surface_points (torch.Tensor): Tensor of shape (N, 3) containing the (x, y, z) coordinates of surface points.
-        num_query_points (int): Number of query points to generate.
-        noise_std (float): Standard deviation of Gaussian noise added to the query points.
-    
-    Returns:
-        query_points (torch.Tensor): Tensor of shape (num_query_points, 3) containing the (x, y, z) coordinates of query points.
-    """
-    # Randomly sample surface points
-    sampled_indices = torch.randint(0, surface_points.shape[0], (num_query_points,))
-    sampled_points = surface_points[sampled_indices]
-    
-    # Add Gaussian noise to the sampled points
-    query_points = sampled_points + torch.randn_like(sampled_points) * noise_std
-    
-    return query_points
+import torch
+import torch.nn.functional as F
+import numpy as np
+from torch.utils.data import Dataset
 
-def voxel_to_sdf_data(voxel_grid, num_query_points=1000, noise_std=0.05):
-    """
-    Convert a binary voxel grid into surface points, normals, and query points suitable for SDF learning.
-    
-    Args:
-        voxel_grid (torch.Tensor): Binary voxel grid of shape (D, H, W), where 1 indicates occupied and 0 indicates unoccupied.
-        num_query_points (int): Number of query points to generate.
-        noise_std (float): Standard deviation of Gaussian noise added to the query points.
-    
-    Returns:
-        surface_points (torch.Tensor): Tensor of shape (N, 3) containing the (x, y, z) coordinates of surface points.
-        normals (torch.Tensor): Tensor of shape (N, 3) containing the normal vectors at each surface point.
-        query_points (torch.Tensor): Tensor of shape (num_query_points, 3) containing the (x, y, z) coordinates of query points.
-    """
-    surface_points, normals = extract_surface_points(voxel_grid)
-    query_points = generate_query_points(surface_points, num_query_points, noise_std)
-    
-    return surface_points, normals, query_points
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+import numpy as np
+from scipy.ndimage import distance_transform_edt, binary_dilation
 
+import trimesh
+
+from skimage import measure
+
+import os
+
+def repair_mesh(mesh):
+    mesh.remove_duplicate_faces()
+    mesh.remove_degenerate_faces()
+    mesh.remove_unreferenced_vertices()
+    mesh.fill_holes()
+    mesh.remove_infinite_values()
+    mesh.rezero()
+
+    if not mesh.is_winding_consistent:
+        mesh.fix_normals()
+
+    return mesh
 class VoxelSDFDataset(Dataset):
-    def __init__(self, voxel_grids, num_query_points=1000, noise_std=0.05, fixed_surface_points_size=1000, device=None):
-        """
-        Custom Dataset for converting voxel grids into surface points, normals, and query points for SDF learning.
-        
-        Args:
-            voxel_grids (list of torch.Tensor): List of binary voxel grids, each of shape (D, H, W).
-            num_query_points (int): Number of query points to generate per voxel grid.
-            noise_std (float): Standard deviation of Gaussian noise added to the query points.
-            fixed_surface_points_size (int): Fixed size of the surface points tensor.
-        """
+    def __init__(self, voxel_grids, num_query_points=1000, noise_std=0.05, 
+                 fixed_surface_points_size=2000, device='cpu', surface_sample_ratio=0.7):
         self.voxel_grids = voxel_grids
         self.num_query_points = num_query_points
         self.noise_std = noise_std
         self.fixed_surface_points_size = fixed_surface_points_size
         self.device = device
+        self.surface_sample_ratio = surface_sample_ratio
+
+        self.surface_data = []
+        self.sdf_grids = []
+
+        # Compute shared normalization constants
+        D, H, W = voxel_grids[0].shape  # e.g., (39, 39, 21)
+        self.voxel_dims = torch.tensor([D, H, W], dtype=torch.float32)
+        self.center = (self.voxel_dims - 1) / 2.0
+        self.scale = self.voxel_dims.max() / 2.0  # To map longest side to [-1,1]
+
+        for vg in voxel_grids:
+            surface_points, normals = self._precompute_surface(vg)
+            self.surface_data.append((surface_points, normals))
+            self.sdf_grids.append(self._get_signed_distance_grid(vg.numpy()))
+
+    def _precompute_surface(self, voxel_grid):
+        voxel_np = voxel_grid.numpy()
+        try:
+            verts, faces, _, _ = measure.marching_cubes(voxel_np, level=0.5)
+        except ValueError:
+            return torch.empty((0, 3)), torch.empty((0, 3))
+
+        # Normalize verts into [-1, 1]^3
+        verts = torch.tensor(verts.copy(), dtype=torch.float32)
+        verts_normalized = (verts - self.center) / self.scale
+
+        mesh = trimesh.Trimesh(vertices=verts_normalized.numpy(), faces=faces, process=False)
+        N = self.fixed_surface_points_size * 2
+        surface_points, face_indices = mesh.sample(N, return_index=True)
+        normals = mesh.face_normals[face_indices]
+        return torch.tensor(surface_points, dtype=torch.float32), torch.tensor(normals, dtype=torch.float32)
+
+    def _get_signed_distance_grid(self, voxel_np):
+        voxel_bool = voxel_np.astype(bool)
+        outside = distance_transform_edt(~voxel_bool)
+        inside = distance_transform_edt(voxel_bool)
+        sdf = outside - inside
+        return torch.tensor(sdf, dtype=torch.float32)
 
     def __len__(self):
-        """Return the number of voxel grids in the dataset."""
         return len(self.voxel_grids)
 
     def __getitem__(self, idx):
-        """
-        Convert a voxel grid into surface points, normals, and query points.
-        
-        Args:
-            idx (int): Index of the voxel grid to process.
-        
-        Returns:
-            point_cloud (torch.Tensor): Tensor of shape (fixed_surface_points_size, 3) containing the (x, y, z) coordinates of surface points.
-            normals (torch.Tensor): Tensor of shape (fixed_surface_points_size, 3) containing the normal vectors at each surface point.
-            query_points (torch.Tensor): Tensor of shape (num_query_points, 3) containing the (x, y, z) coordinates of query points.
-        """
-        voxel_grid = self.voxel_grids[idx]
-        
-        # Extract surface points and normals
-        surface_points, normals = self.extract_surface_points(voxel_grid)
-        
-        # Ensure surface_points and normals have a fixed size
-        surface_points = self.fix_surface_points_size(surface_points)
-        normals = self.fix_surface_points_size(normals)
-        
-        # Generate query points
-        query_points = self.generate_query_points(surface_points, self.num_query_points, self.noise_std)
-        
-        return surface_points.to(self.device),  query_points.to(self.device), normals.to(self.device),
+        surface_points, normals = self.surface_data[idx]
+        surface_points, normals = self._process_to_fixed_size(surface_points, normals)
 
-    @staticmethod
-    def extract_surface_points(voxel_grid):
-        """
-        Extract surface points and normals from a binary voxel grid.
-        Only points strictly on the surface are included (no interior points).
+        query_points = self._generate_query_points(surface_points).to(self.device)
 
-        Args:
-            voxel_grid (torch.Tensor): Binary voxel grid of shape (D, H, W), where 1 indicates occupied and 0 indicates unoccupied.
+        # Prepare for grid_sample: query_points ∈ [-1,1]
+        sdf_grid = self.sdf_grids[idx].unsqueeze(0).unsqueeze(0).to(self.device)
+        coords = query_points.unsqueeze(0).unsqueeze(2).unsqueeze(3)  # [1, N, 1, 1, 3]
+        sdf_values = F.grid_sample(sdf_grid, coords, align_corners=True).squeeze()
 
-        Returns:
-            surface_points (torch.Tensor): Tensor of shape (N, 3) containing the (x, y, z) coordinates of surface points.
-            normals (torch.Tensor): Tensor of shape (N, 3) containing the normal vectors at each surface point.
-        """
-        # Pad the voxel grid to handle edge cases
-        padded_grid = F.pad(voxel_grid.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1, 1, 1), mode='constant', value=0).squeeze()
+        # Normalize SDF by geometric scale
+        sdf_values /= self.scale
 
-        # Original dimensions
-        D, H, W = voxel_grid.shape
+        return surface_points.to(self.device), query_points, sdf_values.to(self.device)
 
-        # Create a mask for surface voxels
-        surface_mask = torch.zeros_like(voxel_grid, dtype=torch.bool)
+    def _process_to_fixed_size(self, points, normals):
+        n_points = points.shape[0]
+        if n_points == self.fixed_surface_points_size:
+            return points, normals
+        elif n_points < self.fixed_surface_points_size:
+            indices = torch.randint(0, n_points, (self.fixed_surface_points_size,))
+            return points[indices], normals[indices]
+        else:
+            idx = torch.randperm(n_points)[:self.fixed_surface_points_size]
+            return points[idx], normals[idx]
 
-        # Check all 6 neighbors for each voxel
-        for dx, dy, dz in [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)]:
-            # Shift the grid and compare with the original
-            shifted_grid = padded_grid[1 + dx:D + 1 + dx, 1 + dy:H + 1 + dy, 1 + dz:W + 1 + dz]
-            surface_mask |= (voxel_grid == 1) & (shifted_grid == 0)
+    def _generate_query_points(self, surface_points):
+        device = surface_points.device
+        n_surface = int(self.num_query_points * self.surface_sample_ratio)
+        n_space = self.num_query_points - n_surface
+        eps = 0.0
 
-        # Extract coordinates of surface voxels
-        surface_indices = torch.nonzero(surface_mask, as_tuple=False).float()
+        if len(surface_points) > 0:
+            idx = torch.randint(0, len(surface_points), (n_surface,), device=device)
+            surface_samples = surface_points[idx] + torch.randn(n_surface, 3, device=device) * self.noise_std
+        else:
+            surface_samples = torch.empty(n_surface, 3, device=device).uniform_(-1, 1)
 
-        # Normalize to [-1, 1]
-        surface_points = (surface_indices / torch.tensor([D, H, W]).float()) * 2 - 1
-
-        # Compute normals using central differences
-        gradient_x = padded_grid[1:D+1, 1:H+1, 2:W+2] - padded_grid[1:D+1, 1:H+1, :-2]  # Shape: (D, H, W-1)
-        gradient_y = padded_grid[1:D+1, 2:H+2, 1:W+1] - padded_grid[1:D+1, :-2, 1:W+1]  # Shape: (D, H-1, W)
-        gradient_z = padded_grid[2:D+2, 1:H+1, 1:W+1] - padded_grid[:-2, 1:H+1, 1:W+1]  # Shape: (D-1, H, W)
-
-        # Truncate to a common shape
-        min_D = min(gradient_x.shape[0], gradient_y.shape[0], gradient_z.shape[0])
-        min_H = min(gradient_x.shape[1], gradient_y.shape[1], gradient_z.shape[1])
-        min_W = min(gradient_x.shape[2], gradient_y.shape[2], gradient_z.shape[2])
-
-        gradient_x = gradient_x[:min_D, :min_H, :min_W]
-        gradient_y = gradient_y[:min_D, :min_H, :min_W]
-        gradient_z = gradient_z[:min_D, :min_H, :min_W]
-
-        # Compute normals from the gradient
-        normals = torch.stack([gradient_x[surface_mask[:min_D, :min_H, :min_W]],
-                            gradient_y[surface_mask[:min_D, :min_H, :min_W]],
-                            gradient_z[surface_mask[:min_D, :min_H, :min_W]]], dim=-1)
-        normals = F.normalize(normals, p=2, dim=-1)  # Normalize to unit vectors
-
-        return surface_points, normals
-
-    def fix_surface_points_size(self, surface_points):
-        """
-        Ensure that the surface points tensor has a fixed size by either padding or sampling.
-        
-        Args:
-            surface_points (torch.Tensor): Tensor of shape (N, 3) containing the (x, y, z) coordinates of surface points.
-        
-        Returns:
-            surface_points (torch.Tensor): Tensor of shape (fixed_surface_points_size, 3) containing the (x, y, z) coordinates of surface points.
-        """
-        num_points = surface_points.shape[0]
-        
-        if num_points < self.fixed_surface_points_size:
-            # Pad with zeros if there are not enough points
-            padding = torch.zeros(self.fixed_surface_points_size - num_points, 3)
-            surface_points = torch.cat([surface_points, padding], dim=0)
-        elif num_points > self.fixed_surface_points_size:
-            # Randomly sample points if there are too many points
-            indices = torch.randperm(num_points)[:self.fixed_surface_points_size]
-            surface_points = surface_points[indices]
-        
-        return surface_points
-
-    def generate_query_points(self, surface_points, num_query_points, noise_std):
-        """
-        Generate query points around the surface points with added noise.
-        
-        Args:
-            surface_points (torch.Tensor): Tensor of shape (N, 3) containing the (x, y, z) coordinates of surface points.
-            num_query_points (int): Number of query points to generate.
-            noise_std (float): Standard deviation of Gaussian noise added to the query points.
-        
-        Returns:
-            query_points (torch.Tensor): Tensor of shape (num_query_points, 3) containing the (x, y, z) coordinates of query points.
-        """
-        # Generate query points by adding noise to the surface points
-        query_points = surface_points + torch.rand_like(surface_points) * noise_std
-        
+        surface_samples = surface_samples.clamp(-1 - eps, 1 + eps)
+        space_samples = torch.empty(n_space, 3, device=device).uniform_(-1 - eps, 1 + eps)
+        query_points = torch.cat([surface_samples, space_samples], dim=0)[torch.randperm(self.num_query_points)]
         return query_points
+
+
+def collate_fn(self, batch):
+    # Ensure we're working with tuples
+    batch = [item if isinstance(item, tuple) else (item['surface_points'], item['query_points'], item['sdf_values']) 
+             for item in batch]
+    
+    point_clouds = [item[0] for item in batch]
+    query_points = torch.stack([item[1] for item in batch])
+    sdf_values = torch.stack([item[2] for item in batch])
+    return point_clouds, query_points, sdf_values
+
+    def _process_to_fixed_size(self, points, normals):
+        n_points = points.shape[0]
+        if n_points == self.fixed_surface_points_size:
+            return points, normals
+        if n_points < self.fixed_surface_points_size:
+            repeat = (self.fixed_surface_points_size // n_points) + 1
+            points = points.repeat(repeat, 1)
+            normals = normals.repeat(repeat, 1)
+        indices = torch.randperm(points.shape[0])[:self.fixed_surface_points_size]
+        return points[indices], normals[indices]
+
+    def _generate_query_points(self, surface_points):
+        device = surface_points.device
+        n_surface = int(self.num_query_points * self.surface_sample_ratio)
+        n_space = self.num_query_points - n_surface
+        eps = 0.0  # padding beyond [-1, 1]^3
+
+        if len(surface_points) > 0:
+            idx = torch.randint(0, len(surface_points), (n_surface,), device=device)
+            surface_samples = surface_points[idx] + torch.randn(n_surface, 3, device=device) * self.noise_std
+        else:
+            surface_samples = torch.empty(n_surface, 3, device=device).uniform_(-1, 1)
+
+        surface_samples = surface_samples.clamp(-1 - eps, 1 + eps)
+        space_samples = torch.rand((n_space, 3), device=device) * (2 + 2*eps) - (1 + eps)
+        query_points = torch.cat([surface_samples, space_samples], dim=0)
+        return query_points[torch.randperm(self.num_query_points)]
 
 def create_voxel_grids(dataset):
     voxel_grids = []
     for model_idx in range(len(dataset)):
-        # Retrieve the model data
         problem, solution = dataset[model_idx]
-        density = solution.θ.squeeze().cpu()  # Density or SDF tensor
+        density = solution.θ.squeeze().cpu()
         voxel_grids.append(density)
+        del density
     return voxel_grids
 
-def prepare_data_for_model(voxel_grid, num_query_points=1000, noise_std=0.05):
-    """
-    Prepare data for the Diffusion-SDF model from a binary voxel grid.
-    
-    Args:
-        voxel_grid (torch.Tensor): Binary voxel grid of shape (D, H, W), where 1 indicates occupied and 0 indicates unoccupied.
-        num_query_points (int): Number of query points to generate.
-        noise_std (float): Standard deviation of Gaussian noise added to the query points.
-    
-    Returns:
-        point_cloud (torch.Tensor): Tensor of shape (1, N, 3) containing the (x, y, z) coordinates of surface points.
-        normals (torch.Tensor): Tensor of shape (1, N, 3) containing the normal vectors at each surface point.
-        query_points (torch.Tensor): Tensor of shape (1, num_query_points, 3) containing the (x, y, z) coordinates of query points.
-    """
-    surface_points, normals, query_points = voxel_to_sdf_data(voxel_grid, num_query_points, noise_std)
-    
-    # Add batch dimension
-    point_cloud = surface_points.unsqueeze(0)  # Shape: (1, N, 3)
-    normals = normals.unsqueeze(0)            # Shape: (1, N, 3)
-    query_points = query_points.unsqueeze(0)  # Shape: (1, num_query_points, 3)
-    
-    return point_cloud, normals, query_points
-    
 def collate_fn(batch):
-    """
-    Collate function for the DataLoader to handle variable-sized surface points.
-    
-    Args:
-        batch (list of tuples): List of (surface_points, query_points) tuples.
-    
-    Returns:
-        point_clouds (list of torch.Tensor): List of surface points tensors, each of shape (N_i, 3).
-        query_points (torch.Tensor): Stacked query points tensor of shape (batch_size, num_query_points, 3).
-    """
     point_clouds = [item[0] for item in batch]
     query_points = torch.stack([item[1] for item in batch])
-    normals = torch.stack([item[2] for item in batch])
-    return point_clouds, query_points, normals
+    sdf_values = torch.stack([item[2] for item in batch])
+    return point_clouds, query_points, sdf_values
 
-# print("Loading SELTO dataset...")
-# selto = SELTODataset(root='.', name='sphere_complex', train=True)
-# print("SELTO dataset loaded!")
-# print("Constructing voxel grids...")
-# breakpoint()
-# voxel_grids = create_voxel_grids(selto)
-# voxel_grid = voxel_grids[0]
-# breakpoint()
-# # Extract surface points
-# surface_points, normals = VoxelSDFDataset.extract_surface_points(voxel_grid)
-
-# # Save the extracted surface as an OBJ file
-# def save_to_obj(filename, vertices, normals=None):
-#     with open(filename, 'w') as f:
-#         for i, v in enumerate(vertices):
-#             f.write(f"v {v[0]} {v[1]} {v[2]}\n")  # Write vertex
-#             if normals is not None:
-#                 f.write(f"vn {normals[i][0]} {normals[i][1]} {normals[i][2]}\n")  # Write normal
-
-# # Save the extracted points
-# save_to_obj("surface.obj", surface_points.numpy(), normals.numpy())
-
-# print("OBJ file saved! Open 'surface.obj' in a 3D viewer.")

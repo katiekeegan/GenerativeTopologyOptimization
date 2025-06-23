@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 class PointNetEncoder(nn.Module):
-    
     def __init__(self, input_dim=3, hidden_dim=128, output_dim=128):
         super(PointNetEncoder, self).__init__()
         self.conv1 = nn.Conv1d(input_dim, hidden_dim, 1)
@@ -30,6 +30,7 @@ class PointNetEncoder(nn.Module):
         x = torch.max(x, 2, keepdim=True)[0]  # Shape: (B, output_dim, 1)
         x = x.view(-1, x.size(1))  # Shape: (B, output_dim)
         return x
+
 
 class ImprovedVAE(nn.Module):
     def __init__(self, input_dim=128, latent_dim=64, hidden_dim=256, num_layers=4):
@@ -75,59 +76,57 @@ class ImprovedVAE(nn.Module):
         x_recon = self.decoder(z)
         
         return x_recon, z, latent_pc  # Return reconstruction and latent vector
+class ResidualBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.Tanh(),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim)
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
 
 class ImprovedSDFNetwork(nn.Module):
-    def __init__(self, input_dim=3, latent_dim=64, hidden_dim=256, output_dim=1, num_layers=8):
-        super(ImprovedSDFNetwork, self).__init__()
-        
-        # Input layer (query points + latent code)
-        self.fc_in = nn.Linear(input_dim, hidden_dim)
+    def __init__(self, input_dim=3, point_dim=3,latent_dim=256, hidden_dim=256, num_blocks=4, output_dim=1, num_layers=4):
+        super().__init__()
 
-        # Hidden layers with skip connections
-        self.fc_hidden = nn.ModuleList([
-            nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers - 1)
-        ])
-        self.skip_connections = nn.ModuleList([
-            nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers - 1)
-        ])
+        # Input: [B, N, point_dim], latent: [B, latent_dim]
+        self.input_proj = nn.Sequential(
+            nn.Linear(point_dim + latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh()
+        )
 
-        # Output layer
-        self.fc_out = nn.Linear(hidden_dim, output_dim)
+        self.res_blocks = nn.Sequential(*[ResidualBlock(hidden_dim) for _ in range(num_blocks)])
 
-    def forward(self, x, z):
+        self.output_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),  # Output: [B, N, 1] (signed SDF)
+            nn.Tanh()
+        )
+
+    def forward(self, query_points, latent):
         """
         Args:
-            x: Query points of shape (B, M, 3), where B is batch size and M is number of query points.
-            z: Latent code of shape (B, latent_dim).
+            query_points: [B, N, 3]
+            latent: [B, latent_dim]
         Returns:
-            sdf_values: Predicted SDF values of shape (B, M, 1).
+            sdf_pred: [B, N]
         """
-        batch_size, num_query_points, _ = x.shape
+        B, N, _ = query_points.shape
+        latent_expanded = latent.unsqueeze(1).expand(-1, N, -1)  # [B, N, latent_dim]
+        x = torch.cat([query_points, latent_expanded], dim=-1)  # [B, N, point_dim + latent_dim]
 
-        # Expand latent code to match the number of query points
-        z_expanded = z.unsqueeze(1).expand(-1, num_query_points, -1)  # Shape: (B, M, latent_dim)
+        x = self.input_proj(x)
+        x = self.res_blocks(x)
+        sdf = self.output_head(x).squeeze(-1)  # [B, N]
 
-        # Concatenate query points with latent code
-        x = torch.cat([x, z_expanded], dim=-1)  # Shape: (B, M, 3 + latent_dim)
-
-        # Reshape for Linear layer: (B * M, 3 + latent_dim)
-        x = x.view(-1, x.size(-1))  # Shape: (B * M, 3 + latent_dim)
-
-        # Input layer
-        x = F.leaky_relu(self.fc_in(x), 0.2)  # Shape: (B * M, hidden_dim)
-
-        # Hidden layers with skip connections
-        for i, layer in enumerate(self.fc_hidden):
-            x = F.leaky_relu(layer(x), 0.2)
-            if i > 0:
-                x = x + self.skip_connections[i - 1](x)  # Skip connection
-
-        # Output layer with tanh activation
-        x = self.fc_out(x)  # Shape: (B * M, 1)
-
-        # Reshape back to (B, M, 1)
-        x = x.view(batch_size, num_query_points, -1)  # Shape: (B, M, 1)
-        return x
+        return sdf
 
 class ModulationModule(nn.Module):
     def __init__(self, vae, sdf_network):
@@ -174,7 +173,7 @@ class DiffusionModel(nn.Module):
             ) for _ in range(num_layers)
         ])
         
-        self.feature_attn = FeatureWiseAttention(latent_dim, num_heads=2)  # Feature-wise attention
+        # self.feature_attn = FeatureWiseAttention(latent_dim, num_heads=2)  # Feature-wise attention
 
     def forward(self, z, t):
         t = t.float().unsqueeze(-1)  
@@ -183,7 +182,7 @@ class DiffusionModel(nn.Module):
         for layer in self.layers:
             z = layer(z + t_embed) + z  # Residual connection
         
-        z = self.feature_attn(z)  # Apply feature-wise attention
+        # z = self.feature_attn(z)  # Apply feature-wise attention
         return z
 
 import math

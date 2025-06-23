@@ -9,3 +9,7 @@ sphere_complex/
 utils/sphere_complex
 *.obj
 *.pth
+*.out
+dl4to/
+checkpoints_vae/
+checkpoints_mod/

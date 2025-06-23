@@ -5,6 +5,7 @@ from scipy.stats import norm
 from utils.preprocess_data import *
 from trainer import *
 from models import *
+from scipy.interpolate import griddata
 
 def sample_from_diffusion_model(diffusion_model, modulation_module, device, timesteps, betas, alphas_cumprod, num_samples=1):
     """
@@ -42,30 +43,44 @@ def decode_latent_sample(modulation_module, z, query_points, device):
     modulation_module.eval()  # Set to evaluation mode
     
     with torch.no_grad():
+        z = modulation_module.vae.decoder(z)
         # # Expand `z` to match the number of query points
-        z_expanded = z.unsqueeze(1).expand(-1, query_points.size(1), -1)
-        
-        # # Concatenate query points with the latent sample
-        concatenated_input = torch.cat([query_points.to(device), z_expanded], dim=2)
         
         # Forward pass through the SDF network
-        sdf_values = modulation_module.sdf_network(concatenated_input)
+        sdf_values = modulation_module.sdf_network(query_points, z)
     print("Decoded!")
     return sdf_values
 
 import numpy as np
 from skimage.measure import marching_cubes
 
-def extract_surface(sdf_values, resolution=64):
+def extract_surface(query_points, sdf_values, resolution=64):
     """
-    Extract a 3D surface from SDF values using Marching Cubes.
+    Extract a 3D surface from query points and SDF values using Marching Cubes.
+    
+    Parameters:
+    - query_points: (N, 3) array of 3D coordinates.
+    - sdf_values: (N,) array of SDF values corresponding to the query points.
+    - resolution: int, the resolution of the 3D grid.
+    
+    Returns:
+    - vertices: (M, 3) array of vertices of the extracted mesh.
+    - faces: (K, 3) array of faces of the extracted mesh.
     """
     print("Extracting...")
-    # Reshape SDF values into a 3D grid
-    sdf_grid = sdf_values.view(resolution, resolution, resolution).cpu().numpy()
+    
+    # Create a regular 3D grid
+    grid_x, grid_y, grid_z = np.mgrid[0:1:resolution*1j, 0:1:resolution*1j, 0:1:resolution*1j]
+    
+    # Interpolate SDF values onto the regular grid
+    sdf_grid = griddata(query_points, sdf_values, (grid_x, grid_y, grid_z), method='linear')
     
     # Run Marching Cubes
-    vertices, faces, _, _ = marching_cubes(sdf_grid, level=0)
+    vertices, faces, _, _ = marching_cubes(sdf_grid, level=0.0)
+    
+    # Normalize vertices to the original scale (assuming query_points are in [0, 1] range)
+    vertices = vertices / (resolution - 1)
+    
     print("Extracted!")
     return vertices, faces
 
@@ -84,37 +99,42 @@ def save_as_obj(vertices, faces, filename="output.obj"):
 
     print(f"Saved as {filename}")
 
+# Parameters
+num_samples=1
+latent_dim = 64
+encoding_dim = 16
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+num_epochs = 1000
+learning_rate = 1e-3
+diffusion_steps = 100
+# Example usage
+timesteps = 1000
+betas = cosine_beta_schedule(timesteps).to(device)
+alphas = 1.0 - betas
+alphas_cumprod = torch.cumprod(alphas, dim=0).to(device)
+resolution=64
+# Step 1: Sample from the diffusion model
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-vae = ImprovedVAE(input_dim=256, latent_dim=128, hidden_dim=512, num_layers=4).to(device)
-sdf_network = ImprovedSDFNetwork(input_dim=3 + 128, hidden_dim=256, output_dim=1, num_layers=8).to(device)
+vae = ImprovedVAE(input_dim=latent_dim, latent_dim=encoding_dim, hidden_dim=512, num_layers=4).to(device)
+sdf_network = ImprovedSDFNetwork(input_dim=encoding_dim, latent_dim = latent_dim, hidden_dim=512, output_dim=1, num_layers=8).to(device)
 modulation_module = ModulationModule(vae, sdf_network).to(device)
-diffusion_model = DiffusionModel(latent_dim=128, hidden_dim=512, num_layers=6).to(device)
+diffusion_model = DiffusionModel(latent_dim=encoding_dim, hidden_dim=512, num_layers=6, timesteps=diffusion_steps).to(device)
 modulation_module_checkpoint = torch.load("modulation_module.pth")
 modulation_module.load_state_dict(modulation_module_checkpoint)  # No key access
 diffusion_model_checkpoint = torch.load("diffusion_model.pth")
 diffusion_model.load_state_dict(diffusion_model_checkpoint)  # No key access
-# Parameters
-num_samples = 1
-resolution = 64
-query_points = torch.rand((num_samples, resolution**3, 3))*2-1  # Query points for SDF evaluation
-num_epochs = 100
-learning_rate = 1e-4
-diffusion_steps = 100
-# Example usage
-timesteps = 100
-betas = cosine_beta_schedule(timesteps).to(device)
-alphas = 1. - betas
-alphas_cumprod = torch.cumprod(alphas, dim=0).to(device)
-# Step 1: Sample from the diffusion model
 z_t = sample_from_diffusion_model(diffusion_model, modulation_module, device, timesteps, betas, alphas_cumprod, num_samples)
 
 # Step 2: Decode the latent sample into SDF values
+query_points = torch.rand((num_samples,30000,3))*2-1
+query_points = query_points.to(device)
 sdf_values = decode_latent_sample(modulation_module, z_t, query_points, device)
 print("SDF Min:", torch.min(sdf_values).item())
 print("SDF Max:", torch.max(sdf_values).item())
 # Step 3: Extract the 3D surface using Marching Cubes
-vertices, faces = extract_surface(sdf_values, resolution)
+vertices, faces = extract_surface(query_points.squeeze().cpu().numpy(), sdf_values.squeeze().cpu().numpy(), resolution)
 
 # Step 4: Visualize the surface
 save_as_obj(vertices, faces)

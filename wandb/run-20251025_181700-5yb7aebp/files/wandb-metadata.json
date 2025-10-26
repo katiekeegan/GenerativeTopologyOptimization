@@ -1,0 +1,112 @@
+{
+  "os":  "Linux-5.14.21-150500.55.97_13.0.78-cray_shasta_c-x86_64-with-glibc2.31",
+  "python":  "CPython 3.12.9",
+  "startedAt":  "2025-10-26T01:17:00.075371Z",
+  "program":  "/pscratch/sd/k/katiekee/GenerativeTopologyOptimization/trainer.py",
+  "codePath":  "trainer.py",
+  "git":  {
+    "remote":  "https://github.com/katiekeegan/GenerativeTopologyOptimization.git",
+    "commit":  "a3adb49e91c30c0c4509dcbb053c290782766496"
+  },
+  "email":  "github@katiekeegan.org",
+  "root":  "/pscratch/sd/k/katiekee/GenerativeTopologyOptimization",
+  "host":  "nid008505",
+  "executable":  "/global/common/software/nersc9/pytorch/2.6.0/bin/python",
+  "codePathLocal":  "trainer.py",
+  "cpu_count":  64,
+  "cpu_count_logical":  128,
+  "gpu":  "NVIDIA A100-SXM4-80GB",
+  "gpu_count":  4,
+  "disk":  {
+    "/":  {
+      "total":  "134860554240",
+      "used":  "623599616"
+    }
+  },
+  "memory":  {
+    "total":  "269721112576"
+  },
+  "cpu":  {
+    "count":  64,
+    "countLogical":  128
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA A100-SXM4-80GB",
+      "memoryTotal":  "85899345920",
+      "cudaCores":  6912,
+      "architecture":  "Ampere"
+    },
+    {
+      "name":  "NVIDIA A100-SXM4-80GB",
+      "memoryTotal":  "85899345920",
+      "cudaCores":  6912,
+      "architecture":  "Ampere"
+    },
+    {
+      "name":  "NVIDIA A100-SXM4-80GB",
+      "memoryTotal":  "85899345920",
+      "cudaCores":  6912,
+      "architecture":  "Ampere"
+    },
+    {
+      "name":  "NVIDIA A100-SXM4-80GB",
+      "memoryTotal":  "85899345920",
+      "cudaCores":  6912,
+      "architecture":  "Ampere"
+    }
+  ],
+  "slurm":  {
+    "cluster_name":  "perlmutter",
+    "cpus_on_node":  "128",
+    "gpus":  "4",
+    "gpus_on_node":  "4",
+    "gtids":  "0",
+    "job_account":  "m1266_g",
+    "job_cpus_per_node":  "128",
+    "job_end_time":  "1761455526",
+    "job_gid":  "103193",
+    "job_gpus":  "0,1,2,3",
+    "job_id":  "44416708",
+    "job_licenses":  "scratch:1",
+    "job_name":  "interactive",
+    "job_nodelist":  "nid008505",
+    "job_num_nodes":  "1",
+    "job_partition":  "urgent_gpu_ss11",
+    "job_qos":  "gpu_interactive",
+    "job_start_time":  "1761441126",
+    "job_uid":  "103193",
+    "job_user":  "katiekee",
+    "jobid":  "44416708",
+    "launch_node_ipaddr":  "128.55.64.40",
+    "localid":  "0",
+    "mpi_type":  "cray_shasta",
+    "nnodes":  "1",
+    "nodeid":  "0",
+    "nodelist":  "nid008505",
+    "oom_kill_step":  "0",
+    "prio_process":  "0",
+    "procid":  "0",
+    "pty_port":  "40933",
+    "pty_win_col":  "55",
+    "pty_win_row":  "17",
+    "script_context":  "prolog_task",
+    "srun_comm_host":  "128.55.64.40",
+    "srun_comm_port":  "40953",
+    "step_id":  "4294967290",
+    "step_launcher_port":  "40953",
+    "step_nodelist":  "nid008505",
+    "step_num_nodes":  "1",
+    "step_num_tasks":  "1",
+    "step_tasks_per_node":  "1",
+    "stepid":  "4294967290",
+    "stepmgr":  "nid008505",
+    "submit_dir":  "/pscratch/sd/k/katiekee/GenerativeTopologyOptimization",
+    "submit_host":  "login31",
+    "task_pid":  "2208914",
+    "tasks_per_node":  "128",
+    "topology_addr":  "nid008505",
+    "topology_addr_pattern":  "node"
+  },
+  "cudaVersion":  "12.4"
+}

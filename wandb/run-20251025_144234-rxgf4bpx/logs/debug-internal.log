@@ -1,0 +1,16 @@
+{"time":"2025-10-25T14:42:34.10035833-07:00","level":"INFO","msg":"stream: starting","core version":"0.19.7","symlink path":"/pscratch/sd/k/katiekee/GenerativeTopologyOptimization/wandb/run-20251025_144234-rxgf4bpx/logs/debug-core.log"}
+{"time":"2025-10-25T14:42:34.215005471-07:00","level":"INFO","msg":"created new stream","id":"rxgf4bpx"}
+{"time":"2025-10-25T14:42:34.215085455-07:00","level":"INFO","msg":"stream: started","id":"rxgf4bpx"}
+{"time":"2025-10-25T14:42:34.215111605-07:00","level":"INFO","msg":"writer: Do: started","stream_id":"rxgf4bpx"}
+{"time":"2025-10-25T14:42:34.215186179-07:00","level":"INFO","msg":"sender: started","stream_id":"rxgf4bpx"}
+{"time":"2025-10-25T14:42:34.21519185-07:00","level":"INFO","msg":"handler: started","stream_id":"rxgf4bpx"}
+{"time":"2025-10-25T14:42:34.568418186-07:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-10-25T14:46:49.134168944-07:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-10-25T14:46:49.134720827-07:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-10-25T14:46:50.13681316-07:00","level":"INFO","msg":"handler: operation stats","stats":{"operations":[{"desc":"uploading checkpoints_vae/vae_last.pth","runtime_seconds":0.450996559,"progress":"17.5MB/288.7MB"},{"desc":"uploading history steps 23-24, summary, console lines 37-37","runtime_seconds":0.141873319}],"total_operations":2}}
+{"time":"2025-10-25T14:46:57.02202438-07:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-10-25T14:46:58.214635727-07:00","level":"INFO","msg":"stream: closing","id":"rxgf4bpx"}
+{"time":"2025-10-25T14:46:58.214713417-07:00","level":"INFO","msg":"handler: closed","stream_id":"rxgf4bpx"}
+{"time":"2025-10-25T14:46:58.214737282-07:00","level":"INFO","msg":"writer: Close: closed","stream_id":"rxgf4bpx"}
+{"time":"2025-10-25T14:46:58.214991162-07:00","level":"INFO","msg":"sender: closed","stream_id":"rxgf4bpx"}
+{"time":"2025-10-25T14:46:58.21510463-07:00","level":"INFO","msg":"stream: closed","id":"rxgf4bpx"}

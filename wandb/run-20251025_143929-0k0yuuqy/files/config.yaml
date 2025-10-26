@@ -1,0 +1,42 @@
+_wandb:
+    value:
+        cli_version: 0.19.7
+        m: []
+        python_version: 3.12.9
+        t:
+            "1":
+                - 1
+                - 55
+                - 105
+            "2":
+                - 1
+                - 55
+                - 105
+            "3":
+                - 16
+                - 23
+                - 55
+            "4": 3.12.9
+            "5": 0.19.7
+            "8":
+                - 5
+            "12": 0.19.7
+            "13": linux-x86_64
+local_rank:
+    value: 0
+no_wandb:
+    value: false
+per_gpu_batch:
+    value: 2
+stage1_epochs:
+    value: 25
+stage2_epochs:
+    value: 10000
+wandb_entity:
+    value: null
+wandb_project:
+    value: generative_topology_optimization
+wandb_run_name:
+    value: null
+world_size:
+    value: 4

@@ -1,0 +1,10 @@
+{"time":"2025-10-25T14:39:29.058665941-07:00","level":"INFO","msg":"stream: starting","core version":"0.19.7","symlink path":"/pscratch/sd/k/katiekee/GenerativeTopologyOptimization/wandb/run-20251025_143929-0k0yuuqy/logs/debug-core.log"}
+{"time":"2025-10-25T14:39:29.304615651-07:00","level":"INFO","msg":"created new stream","id":"0k0yuuqy"}
+{"time":"2025-10-25T14:39:29.304687228-07:00","level":"INFO","msg":"stream: started","id":"0k0yuuqy"}
+{"time":"2025-10-25T14:39:29.304731914-07:00","level":"INFO","msg":"handler: started","stream_id":"0k0yuuqy"}
+{"time":"2025-10-25T14:39:29.304730943-07:00","level":"INFO","msg":"writer: Do: started","stream_id":"0k0yuuqy"}
+{"time":"2025-10-25T14:39:29.304740611-07:00","level":"INFO","msg":"sender: started","stream_id":"0k0yuuqy"}
+{"time":"2025-10-25T14:39:29.588621373-07:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-10-25T14:39:38.531221667-07:00","level":"INFO","msg":"stream: closing","id":"0k0yuuqy"}
+{"time":"2025-10-25T14:39:38.531246595-07:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-10-25T14:39:38.531728513-07:00","level":"INFO","msg":"Stopped system monitor"}

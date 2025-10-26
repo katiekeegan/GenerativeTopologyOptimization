@@ -9,37 +9,27 @@ import dl4to  # now this import won't fail
 from dl4to.datasets import SELTODataset
 from torch.optim.lr_scheduler import StepLR
 from torch.cuda.amp import GradScaler, autocast
+import torch.nn.functional as F
+import math
+import os
 torch.cuda.empty_cache()  # After each step
 
-def sdf_loss_function(sdf_pred, sdf_gt, beta=10.0, gamma=10.0, sigma=1.0):
+def sdf_loss_function(sdf_pred, sdf_gt):
     """
-    Composite loss:
-    - Distance-based MSE
-    - Sign classification BCE
-    - Gaussian-weighted near-surface MSE
+    Loss matching the paper's description:
+    - L1 loss between predicted and ground-truth signed distances.
+
+    Returns:
+        total_loss (tensor), dict with components
     """
-    # Clamp values to reasonable range
-    sdf_pred_clamped = sdf_pred#.clamp(-1.0, 1.0)
-    sdf_gt_clamped = sdf_gt#.clamp(-1.0, 1.0)
+    # Ensure shapes: [B, N] or [B, N, 1] -> squeeze last dim
+    sdf_pred_clamped = sdf_pred
+    sdf_gt_clamped = sdf_gt
 
-    # --- 1. Base MSE Loss ---
-    loss_mse = F.mse_loss(sdf_pred_clamped.squeeze(), sdf_gt_clamped.squeeze())
+    # L1 loss per the paper
+    loss_l1 = F.l1_loss(sdf_pred_clamped.squeeze(), sdf_gt_clamped.squeeze(), reduction='mean')
 
-    # --- 2. Sign Loss ---
-    sign_gt = (sdf_gt > 0).float()
-    margin = 0.0
-    # print("sdf_gt range:", sdf_gt.min().item(), sdf_gt.max().item())
-    # print("sdf_pred range:", sdf_pred.min().item(), sdf_pred.max().item())
-
-    loss_sign = F.relu(margin - sdf_pred * (2 * sign_gt - 1)).mean()
-
-    # --- 3. Near-Surface Weighted Loss ---
-    weights = torch.exp(- (sdf_gt ** 2) / (2 * sigma ** 2)).clamp(min=0.05)
-    loss_surface_weighted = (weights * (sdf_pred_clamped - sdf_gt_clamped).pow(2)).mean()
-
-    # Final loss: balance terms
-    total_loss = loss_mse + beta * loss_sign + gamma * loss_surface_weighted
-    return total_loss, {"mse": loss_mse.item(), "sign": loss_sign.item(), "surface": loss_surface_weighted.item()}
+    return loss_l1, {"l1": loss_l1.item()}
 
 def compute_sdf(query_points, surface_points, normals, epsilon=1e-8):
     """
@@ -74,10 +64,14 @@ def compute_sdf(query_points, surface_points, normals, epsilon=1e-8):
     sign = torch.sign(dot)
     del nearest_points
     del nearest_normals
-    # 6. Final SDF [B, N, 1]
+    # 6. Final SDF [B, N]
     return (min_dist * sign).squeeze()
 
-def train_stage_1_vae(vae_module, train_dataloader, optimizer, device, num_epochs, ckpt_dir="checkpoints_vae", resume=False):
+def train_stage_1_vae(vae_module, train_dataloader, optimizer, device, num_epochs, ckpt_dir="checkpoints_vae", resume=False, beta_kl=1e-5, prior_std=0.25):
+    """
+    Stage 1: train VAE. Keeps reconstruction loss but uses KL that regularizes
+    q(z|π) toward N(0, prior_std^2) and weights KL by beta_kl (default 1e-5 per paragraph).
+    """
     vae_module.train()
     scaler = GradScaler()
     scheduler = StepLR(optimizer, step_size=20, gamma=0.1)
@@ -92,9 +86,6 @@ def train_stage_1_vae(vae_module, train_dataloader, optimizer, device, num_epoch
         total_recon_loss = 0.0
         total_kl_loss = 0.0
         
-        # Beta annealing: linearly increase from 0 to 1 over the number of stage-1 epochs
-        beta_kl = min(1.0, epoch / num_epochs)
-        
         for batch_idx, (point_clouds, query_points, _) in enumerate(train_dataloader):
             point_clouds = torch.stack(point_clouds).to(device)
             optimizer.zero_grad()
@@ -103,15 +94,17 @@ def train_stage_1_vae(vae_module, train_dataloader, optimizer, device, num_epoch
                 # VAE forward pass: returns (x_recon, z, latent_pc, mu, logvar)
                 x_recon, z, latent_pc, mu, logvar = vae_module(point_clouds)
                 
-                # Reconstruction loss: reconstruct the latent_pc (encoded point cloud features)
-                # Note: x_recon is in the same feature space as latent_pc
+                # Reconstruction loss: keep for VAE training
                 recon_loss = F.mse_loss(x_recon, latent_pc, reduction='mean')
                 
-                # KL divergence loss: KL(N(mu, sigma) || N(0, I))
-                # Formula: -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-                kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+                # KL divergence to N(0, prior_std^2)
+                sigma2 = logvar.exp()
+                prior_var = prior_std ** 2
+                # KL per-sample
+                kl_per_sample = 0.5 * ( (sigma2 + mu.pow(2)) / prior_var - 1 - logvar + math.log(prior_var) ).sum(dim=1)
+                kl = kl_per_sample.mean()
                 
-                # Total VAE loss with beta annealing
+                # Total VAE loss with small beta as described
                 loss = recon_loss + beta_kl * kl
 
             scaler.scale(loss).backward()
@@ -127,14 +120,13 @@ def train_stage_1_vae(vae_module, train_dataloader, optimizer, device, num_epoch
         avg_total_loss = avg_recon_loss + beta_kl * avg_kl_loss
         
         print(f"Stage 1 - Epoch [{epoch + 1}/{num_epochs}], "
-              f"Total Loss: {avg_total_loss:.4f}, "
-              f"Recon Loss: {avg_recon_loss:.4f}, "
-              f"KL Loss: {avg_kl_loss:.4f}, "
-              f"Beta: {beta_kl:.4f}")
+              f"Total Loss: {avg_total_loss:.6f}, "
+              f"Recon Loss: {avg_recon_loss:.6f}, "
+              f"KL Loss: {avg_kl_loss:.6f}, "
+              f"Beta: {beta_kl:.6e}")
         scheduler.step()
 
         if (epoch + 1) % 10 == 0:
-            # Save checkpoint with recon and KL components
             checkpoint_loss = {
                 'total': avg_total_loss,
                 'recon': avg_recon_loss,
@@ -145,7 +137,14 @@ def train_stage_1_vae(vae_module, train_dataloader, optimizer, device, num_epoch
             save_checkpoint(vae_module, optimizer, epoch, checkpoint_loss, os.path.join(ckpt_dir, f"vae_epoch_{epoch}.pth"))
 
 
-def train_stage_2_modulation(modulation_module, train_dataloader, optimizer, device, num_epochs, beta=1e-4, ckpt_dir="checkpoints_mod", resume=False):
+def train_stage_2_modulation(modulation_module, train_dataloader, optimizer, device, num_epochs, ckpt_dir="checkpoints_mod", resume=False):
+    """
+    Stage 2: train modulation module for SDF prediction.
+    Following the paragraph:
+      - Use L1 loss between predicted and GT SDF for query points
+      - Do NOT add a VAE reconstruction loss term here
+      - KL regularization is part of the VAE (stage 1) and is already applied there
+    """
     modulation_module.train()
     scaler = GradScaler()
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -160,23 +159,21 @@ def train_stage_2_modulation(modulation_module, train_dataloader, optimizer, dev
         for batch_idx, (point_clouds, query_points, sdf_gt) in enumerate(train_dataloader):
             point_clouds = torch.stack(point_clouds).to(device)
             query_points = query_points.to(device)
+            sdf_gt = sdf_gt.to(device)
 
             optimizer.zero_grad()
 
             with autocast():
-                # Safe unpacking: modulation_module now returns 6-tuple
-                # (sdf_pred, z, latent_pc, x_recon, mu, logvar)
+                # modulation_module returns (sdf_pred, z, latent_pc, x_recon, mu, logvar) or similar
                 outputs = modulation_module(point_clouds, query_points)
-                sdf_pred, z, latent_pc, x_recon = outputs[:4]
-                # mu and logvar are available but not used in stage 2 training
-                mu, logvar = (outputs[4], outputs[5]) if len(outputs) > 4 else (None, None)
-
+                sdf_pred = outputs[0]
+                # other outputs are available if needed
                 if sdf_pred.dim() == 3:
                     sdf_pred = sdf_pred.squeeze(-1)
 
+                # Per-paper SDF loss (L1)
                 loss, loss_dict = sdf_loss_function(sdf_pred, sdf_gt)
-                recon_loss = F.mse_loss(x_recon, latent_pc)
-                loss += recon_loss
+                # IMPORTANT: do NOT add a VAE reconstruction loss here (per the paragraph)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -184,7 +181,7 @@ def train_stage_2_modulation(modulation_module, train_dataloader, optimizer, dev
             total_loss += loss.item()
 
         avg_loss = total_loss / len(train_dataloader)
-        print(f"Stage 2 - Epoch [{epoch + 1}/{num_epochs}] - Total Loss: {avg_loss:.4f}")
+        print(f"Stage 2 - Epoch [{epoch + 1}/{num_epochs}] - Total Loss: {avg_loss:.6f}")
 
         if (epoch + 1) % 100 == 0:
             save_checkpoint(modulation_module, optimizer, epoch, avg_loss, os.path.join(ckpt_dir, "mod_last.pth"))
@@ -199,7 +196,8 @@ def staged_training(modulation_module, train_dataloader, device, num_epochs_stag
     # Stage 1: Train the VAE
     print("Starting Stage 1: Training VAE...")
     vae_optimizer = optim.Adam(modulation_module.vae.parameters(), lr=0.0001)
-    train_stage_1_vae(modulation_module.vae, train_dataloader, vae_optimizer, device, num_epochs_stage_1, resume=False)
+    # Use small beta and prior_std per the paper description
+    train_stage_1_vae(modulation_module.vae, train_dataloader, vae_optimizer, device, num_epochs_stage_1, resume=False, beta_kl=1e-5, prior_std=0.25)
     torch.cuda.empty_cache()  # After each step
     # Stage 2: Train the modulation module
     print("Starting Stage 2: Training Modulation Module...")
@@ -222,12 +220,8 @@ def train_diffusion_model(diffusion_model, modulation_module, dataloader, optimi
             
             # Forward pass through the modulation module (no gradients)
             with torch.no_grad():
-                # Safe unpacking: modulation_module now returns 6-tuple
-                # (sdf_pred, z, latent_pc, x_recon, mu, logvar)
                 outputs = modulation_module(point_clouds, query_points)
                 sdf_values, z, latent_pc, x_recon = outputs[:4]
-                # mu and logvar are available but not used in diffusion training
-                mu, logvar = (outputs[4], outputs[5]) if len(outputs) > 4 else (None, None)
             
             # Sample a random time step `t`
             t = torch.randint(0, timesteps, (z.size(0),), device=device)
@@ -251,8 +245,6 @@ def train_diffusion_model(diffusion_model, modulation_module, dataloader, optimi
         # Print epoch loss
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch [{epoch + 1}/{num_epochs}], Diffusion Model Loss: {avg_loss:.4f}")
-
-import os
 
 def save_checkpoint(model, optimizer, epoch, loss, filename):
     checkpoint = {
@@ -303,23 +295,8 @@ def main():
     sdf_network = ImprovedSDFNetwork(input_dim=encoding_dim, latent_dim = latent_dim, hidden_dim=512, output_dim=1, num_layers=4).to(device)
     modulation_module = ModulationModule(vae, sdf_network).to(device)
     optimizer = torch.optim.Adam(modulation_module.parameters(), lr=1e-4)
-    staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1=25, num_epochs_stage_2=10000)
+    staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1=50, num_epochs_stage_2=100)
     torch.save(modulation_module.state_dict(), "modulation_module.pth")
-    # modulation_module_checkpoint = torch.load("modulation_module.pth")
-    # modulation_module.load_state_dict(modulation_module_checkpoint)  # No key access
-    # checkpoint = torch.load("checkpoints_mod/mod_last.pth", map_location=device)
-    # if "model_state_dict" in checkpoint:
-    #     modulation_module.load_state_dict(checkpoint["model_state_dict"])
-    # else:
-    #     modulation_module.load_state_dict(checkpoint)
-    # print("Training diffusion model...")
-    # diffusion_model = DiffusionModel(latent_dim=encoding_dim, hidden_dim=512, num_layers=6, timesteps=diffusion_steps).to(device)
-    # diffusion_optimizer = optim.Adam(diffusion_model.parameters(), lr=learning_rate)
-    # train_diffusion_model(diffusion_model, modulation_module, train_dataloader, diffusion_optimizer, device, diffusion_steps, betas, alphas_cumprod, 1000)
-    # print("Diffusion model trained!")
-
-    # # After training the modulation module
-    # torch.save(diffusion_model.state_dict(), "diffusion_model.pth")
 
 if __name__ == "__main__":
     torch.cuda.empty_cache()  # After each step

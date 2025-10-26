@@ -1,0 +1,16 @@
+{"time":"2025-10-25T18:17:00.077645883-07:00","level":"INFO","msg":"stream: starting","core version":"0.19.7","symlink path":"/pscratch/sd/k/katiekee/GenerativeTopologyOptimization/wandb/run-20251025_181700-5yb7aebp/logs/debug-core.log"}
+{"time":"2025-10-25T18:17:00.188595393-07:00","level":"INFO","msg":"created new stream","id":"5yb7aebp"}
+{"time":"2025-10-25T18:17:00.188662362-07:00","level":"INFO","msg":"stream: started","id":"5yb7aebp"}
+{"time":"2025-10-25T18:17:00.188681318-07:00","level":"INFO","msg":"writer: Do: started","stream_id":"5yb7aebp"}
+{"time":"2025-10-25T18:17:00.18872353-07:00","level":"INFO","msg":"sender: started","stream_id":"5yb7aebp"}
+{"time":"2025-10-25T18:17:00.188719672-07:00","level":"INFO","msg":"handler: started","stream_id":"5yb7aebp"}
+{"time":"2025-10-25T18:17:00.451536046-07:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-10-25T18:21:10.292174058-07:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-10-25T18:21:10.292716393-07:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-10-25T18:21:11.294643894-07:00","level":"INFO","msg":"handler: operation stats","stats":{"operations":[{"desc":"uploading checkpoints_vae/vae_last.pth","runtime_seconds":0.217219346,"progress":"8.1MB/288.7MB"}],"total_operations":1}}
+{"time":"2025-10-25T18:21:18.462809318-07:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-10-25T18:21:19.629748359-07:00","level":"INFO","msg":"stream: closing","id":"5yb7aebp"}
+{"time":"2025-10-25T18:21:19.629835387-07:00","level":"INFO","msg":"handler: closed","stream_id":"5yb7aebp"}
+{"time":"2025-10-25T18:21:19.629866366-07:00","level":"INFO","msg":"sender: closed","stream_id":"5yb7aebp"}
+{"time":"2025-10-25T18:21:19.629864122-07:00","level":"INFO","msg":"writer: Close: closed","stream_id":"5yb7aebp"}
+{"time":"2025-10-25T18:21:19.63020566-07:00","level":"INFO","msg":"stream: closed","id":"5yb7aebp"}

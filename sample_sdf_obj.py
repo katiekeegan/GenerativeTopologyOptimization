@@ -51,7 +51,8 @@ def extract_shape_from_latent(modulation_module, dataloader, device, voxel_grid,
     query_points = (query_points - 0.5) * 2.0
 
     # 5. Predict SDF
-    sdf_pred, _, _, _ = modulation_module(point_cloud, query_points)
+    outputs = modulation_module(point_cloud, query_points)
+    sdf_pred = outputs[0]  # First element is sdf_pred
     sdf_pred = sdf_pred.view(grid_resolution, grid_resolution, grid_resolution).cpu().numpy()
     print(f"SDF pred stats: min={sdf_pred.min():.4f}, max={sdf_pred.max():.4f}, mean={sdf_pred.mean():.4f}")
 

@@ -44,9 +44,14 @@ def bayesian_optimization_in_latent_space(ldm, physics_solver, num_iters=20, num
     best_idx = np.argmax(Y)
     return ldm.decode(Z[best_idx]), Y[best_idx]  # Return best design
 
-modulation_module = ModulationModule(pointnet_input_dim=3, pointnet_output_dim=256, latent_dim=128).to(device)
-diffusion_model = DiffusionModel(latent_dim=128, hidden_dim=512, num_layers=6).to(device)
-modulation_module_checkpoint = torch.load("modulation_module.pth")
-modulation_module.load_state_dict(modulation_module_checkpoint['model_state_dict'])
-diffusion_model_checkpoint = torch.load("diffusion_model.pth")
-diffusion_model.load_state_dict(diffusion_model_checkpoint['model_state_dict'])
+# Note: These lines need device definition and proper model initialization
+# Example initialization (uncomment and define device/parameters as needed):
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# vae = ImprovedVAE(input_dim=256, latent_dim=128, hidden_dim=512, num_layers=4).to(device)
+# sdf_network = ImprovedSDFNetwork(input_dim=128, latent_dim=256, hidden_dim=512, output_dim=1, num_layers=4).to(device)
+# modulation_module = ModulationModule(vae, sdf_network).to(device)
+# diffusion_model = DiffusionModel(latent_dim=128, hidden_dim=512, num_layers=6).to(device)
+# modulation_module_checkpoint = torch.load("modulation_module.pth")
+# modulation_module.load_state_dict(modulation_module_checkpoint['model_state_dict'])
+# diffusion_model_checkpoint = torch.load("diffusion_model.pth")
+# diffusion_model.load_state_dict(diffusion_model_checkpoint['model_state_dict'])

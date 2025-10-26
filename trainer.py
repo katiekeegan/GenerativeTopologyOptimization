@@ -89,29 +89,60 @@ def train_stage_1_vae(vae_module, train_dataloader, optimizer, device, num_epoch
         start_epoch, _ = load_checkpoint(vae_module, optimizer, ckpt_path, device)
 
     for epoch in range(start_epoch, num_epochs):
-        total_loss = 0.0
+        total_recon_loss = 0.0
+        total_kl_loss = 0.0
+        
+        # Beta annealing: linearly increase from 0 to 1 over the number of stage-1 epochs
+        beta_kl = min(1.0, epoch / num_epochs)
+        
         for batch_idx, (point_clouds, query_points, _) in enumerate(train_dataloader):
             point_clouds = torch.stack(point_clouds).to(device)
             optimizer.zero_grad()
 
             with autocast():
-                x_recon, z, latent_pc = vae_module(point_clouds)
-                recon_loss = F.mse_loss(x_recon, latent_pc)
+                # VAE forward pass: returns (x_recon, z, latent_pc, mu, logvar)
+                x_recon, z, latent_pc, mu, logvar = vae_module(point_clouds)
+                
+                # Reconstruction loss: reconstruct the latent_pc (encoded point cloud features)
+                # Note: x_recon is in the same feature space as latent_pc
+                recon_loss = F.mse_loss(x_recon, latent_pc, reduction='mean')
+                
+                # KL divergence loss: KL(N(mu, sigma) || N(0, I))
+                # Formula: -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+                kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+                
+                # Total VAE loss with beta annealing
+                loss = recon_loss + beta_kl * kl
 
-            scaler.scale(recon_loss).backward()
+            scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(vae_module.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
-            total_loss += recon_loss.item()
+            total_recon_loss += recon_loss.item()
+            total_kl_loss += kl.item()
 
-        avg_loss = total_loss / len(train_dataloader)
-        print(f"Stage 1 - Epoch [{epoch + 1}/{num_epochs}], VAE Loss: {avg_loss:.4f}")
+        avg_recon_loss = total_recon_loss / len(train_dataloader)
+        avg_kl_loss = total_kl_loss / len(train_dataloader)
+        avg_total_loss = avg_recon_loss + beta_kl * avg_kl_loss
+        
+        print(f"Stage 1 - Epoch [{epoch + 1}/{num_epochs}], "
+              f"Total Loss: {avg_total_loss:.4f}, "
+              f"Recon Loss: {avg_recon_loss:.4f}, "
+              f"KL Loss: {avg_kl_loss:.4f}, "
+              f"Beta: {beta_kl:.4f}")
         scheduler.step()
 
         if (epoch + 1) % 10 == 0:
-            save_checkpoint(vae_module, optimizer, epoch, avg_loss, os.path.join(ckpt_dir, "vae_last.pth"))
-            save_checkpoint(vae_module, optimizer, epoch, avg_loss, os.path.join(ckpt_dir, f"vae_epoch_{epoch}.pth"))
+            # Save checkpoint with recon and KL components
+            checkpoint_loss = {
+                'total': avg_total_loss,
+                'recon': avg_recon_loss,
+                'kl': avg_kl_loss,
+                'beta': beta_kl
+            }
+            save_checkpoint(vae_module, optimizer, epoch, checkpoint_loss, os.path.join(ckpt_dir, "vae_last.pth"))
+            save_checkpoint(vae_module, optimizer, epoch, checkpoint_loss, os.path.join(ckpt_dir, f"vae_epoch_{epoch}.pth"))
 
 
 def train_stage_2_modulation(modulation_module, train_dataloader, optimizer, device, num_epochs, beta=1e-4, ckpt_dir="checkpoints_mod", resume=False):
@@ -133,7 +164,12 @@ def train_stage_2_modulation(modulation_module, train_dataloader, optimizer, dev
             optimizer.zero_grad()
 
             with autocast():
-                sdf_pred, z, latent_pc, x_recon = modulation_module(point_clouds, query_points)
+                # Safe unpacking: modulation_module now returns 6-tuple
+                # (sdf_pred, z, latent_pc, x_recon, mu, logvar)
+                outputs = modulation_module(point_clouds, query_points)
+                sdf_pred, z, latent_pc, x_recon = outputs[:4]
+                # mu and logvar are available but not used in stage 2 training
+                mu, logvar = (outputs[4], outputs[5]) if len(outputs) > 4 else (None, None)
 
                 if sdf_pred.dim() == 3:
                     sdf_pred = sdf_pred.squeeze(-1)
@@ -186,7 +222,12 @@ def train_diffusion_model(diffusion_model, modulation_module, dataloader, optimi
             
             # Forward pass through the modulation module (no gradients)
             with torch.no_grad():
-                sdf_values, z, latent_pc, x_recon = modulation_module(point_clouds, query_points)
+                # Safe unpacking: modulation_module now returns 6-tuple
+                # (sdf_pred, z, latent_pc, x_recon, mu, logvar)
+                outputs = modulation_module(point_clouds, query_points)
+                sdf_values, z, latent_pc, x_recon = outputs[:4]
+                # mu and logvar are available but not used in diffusion training
+                mu, logvar = (outputs[4], outputs[5]) if len(outputs) > 4 else (None, None)
             
             # Sample a random time step `t`
             t = torch.randint(0, timesteps, (z.size(0),), device=device)

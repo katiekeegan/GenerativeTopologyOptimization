@@ -39,7 +39,7 @@ class ImprovedVAE(nn.Module):
         # PointNetEncoder for surface point clouds
         self.pointnetencoder = PointNetEncoder(output_dim=input_dim)
 
-        # Encoder
+        # Encoder - outputs intermediate representation
         encoder_layers = []
         encoder_layers.append(nn.Linear(input_dim, hidden_dim))
         encoder_layers.append(nn.LayerNorm(hidden_dim))  # LayerNorm
@@ -50,8 +50,11 @@ class ImprovedVAE(nn.Module):
             encoder_layers.append(nn.LayerNorm(hidden_dim))
             encoder_layers.append(nn.LeakyReLU(0.2))
         
-        encoder_layers.append(nn.Linear(hidden_dim, latent_dim))  # Output latent vector directly
         self.encoder = nn.Sequential(*encoder_layers)
+        
+        # VAE-specific: separate heads for mu and logvar
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
 
         # Decoder (optional, for reconstruction)
         decoder_layers = []
@@ -67,15 +70,36 @@ class ImprovedVAE(nn.Module):
         decoder_layers.append(nn.Linear(hidden_dim, input_dim))  # Reconstruct global feature
         self.decoder = nn.Sequential(*decoder_layers)
     
+    def reparameterize(self, mu, logvar):
+        """
+        Reparameterization trick: z = mu + eps * std
+        where eps ~ N(0, I) and std = exp(0.5 * logvar)
+        """
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
     def forward(self, x):
         # Encode surface point cloud
         latent_pc = self.pointnetencoder(x)
-        z = self.encoder(latent_pc)  # Directly output latent vector
+        h = self.encoder(latent_pc)  # Intermediate representation
+        
+        # VAE: split into mu and logvar
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        
+        # Reparameterization trick to sample z
+        z = self.reparameterize(mu, logvar)
         
         # Decode (optional)
         x_recon = self.decoder(z)
         
-        return x_recon, z, latent_pc  # Return reconstruction and latent vector
+        # Return: (x_recon, z, latent_pc, mu, logvar)
+        # - x_recon: reconstruction in same shape as latent_pc (will be used to reconstruct original input)
+        # - z: sampled latent vector
+        # - latent_pc: encoded point cloud features (for backward compatibility)
+        # - mu, logvar: variational parameters for KL divergence computation
+        return x_recon, z, latent_pc, mu, logvar
 class ResidualBlock(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -135,13 +159,14 @@ class ModulationModule(nn.Module):
         self.sdf_network = sdf_network
 
     def forward(self, point_cloud, query_points):
-        # Step 1: Encode the surface point cloud
-        x_recon, z, latent_pc = self.vae(point_cloud)
+        # Step 1: Encode the surface point cloud (now returns 5 values for VAE)
+        x_recon, z, latent_pc, mu, logvar = self.vae(point_cloud)
 
         # Step 2: Predict SDF values at query points
         sdf_values = self.sdf_network(query_points, x_recon)
 
-        return sdf_values, z, latent_pc, x_recon
+        # Return 6-tuple: (sdf_pred, z, latent_pc, x_recon, mu, logvar)
+        return sdf_values, z, latent_pc, x_recon, mu, logvar
 
 class FeatureWiseAttention(nn.Module):
     def __init__(self, latent_dim=128, num_heads=8):
@@ -218,6 +243,6 @@ class DiffusionSDF(nn.Module):
         self.diffusion_model = diffusion_model
 
     def forward(self, point_cloud, query_points, t):
-        sdf_values, z, mu, logvar = self.modulation_module(point_cloud, query_points)
+        sdf_values, z, latent_pc, x_recon, mu, logvar = self.modulation_module(point_cloud, query_points)
         z_t = self.diffusion_model(z, t)
         return z_t, sdf_values, z, mu, logvar

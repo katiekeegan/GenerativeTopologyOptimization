@@ -93,7 +93,6 @@ def train_stage_1_vae(vae_module, train_dataloader, optimizer, device, num_epoch
             with autocast():
                 # VAE forward pass: returns (x_recon, z, latent_pc, mu, logvar)
                 x_recon, z, latent_pc, mu, logvar = vae_module(point_clouds)
-                
                 # Reconstruction loss: keep for VAE training
                 recon_loss = F.mse_loss(x_recon, latent_pc, reduction='mean')
                 
@@ -173,6 +172,7 @@ def train_stage_2_modulation(modulation_module, train_dataloader, optimizer, dev
 
                 # Per-paper SDF loss (L1)
                 loss, loss_dict = sdf_loss_function(sdf_pred, sdf_gt)
+                
                 # IMPORTANT: do NOT add a VAE reconstruction loss here (per the paragraph)
 
             scaler.scale(loss).backward()
@@ -189,21 +189,153 @@ def train_stage_2_modulation(modulation_module, train_dataloader, optimizer, dev
 
 
 
-def staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1, num_epochs_stage_2):
+# def staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1, num_epochs_stage_2):
+#     """
+#     Full staged training pipeline.
+#     """
+def staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1, num_epochs_stage_2, beta_kl=1e-5, prior_std=0.25, lr=1e-4):
     """
-    Full staged training pipeline.
+    Joint training loop that optimizes the SDF L1 loss and the VAE KL regularizer
+    together. The function runs for `num_epochs_stage_1 + num_epochs_stage_2` epochs
+    but performs the same joint update every epoch (so effectively it's a single
+    training loop that lasts `total_epochs`).
+
+    Per-batch loss: L = L_sdf + beta_kl * KL(q(z|x) || N(0, prior_std^2)).
+    We do NOT include the VAE reconstruction loss in the default joint objective
+    to match the paper's Stage-2 emphasis unless the network explicitly returns
+    a recon and you want to include it (we still log it if available).
     """
-    # Stage 1: Train the VAE
-    print("Starting Stage 1: Training VAE...")
-    vae_optimizer = optim.Adam(modulation_module.vae.parameters(), lr=0.0001)
-    # Use small beta and prior_std per the paper description
-    train_stage_1_vae(modulation_module.vae, train_dataloader, vae_optimizer, device, num_epochs_stage_1, resume=False, beta_kl=1e-5, prior_std=0.25)
-    torch.cuda.empty_cache()  # After each step
-    # Stage 2: Train the modulation module
-    print("Starting Stage 2: Training Modulation Module...")
-    full_optimizer = optim.Adam(modulation_module.parameters(), lr=0.0001)
-    train_stage_2_modulation(modulation_module, train_dataloader, full_optimizer, device, num_epochs_stage_2, resume=False)
-    torch.cuda.empty_cache()  # After each step
+    total_epochs = int(num_epochs_stage_1) + int(num_epochs_stage_2)
+
+    optimizer = optim.Adam(modulation_module.parameters(), lr=lr)
+    scaler = GradScaler()
+
+    os.makedirs("checkpoints_mod", exist_ok=True)
+    os.makedirs("checkpoints_vae", exist_ok=True)
+
+    print(f"Joint training for {total_epochs} epochs (SDF + beta_kl*KL). beta_kl={beta_kl}, prior_std={prior_std}")
+
+    for epoch in range(total_epochs):
+        modulation_module.train()
+        epoch_sdf_loss = 0.0
+        epoch_kl_loss = 0.0
+        epoch_recon_loss = 0.0
+
+        for batch_idx, batch in enumerate(train_dataloader):
+            # Expect batches like (point_clouds, query_points, sdf_gt)
+            if len(batch) == 3:
+                point_clouds, query_points, sdf_gt = batch
+            elif len(batch) == 2:
+                point_clouds, query_points = batch
+                sdf_gt = None
+            else:
+                # fallback: treat whole batch as point_clouds
+                point_clouds = batch[0]
+                query_points = None
+                sdf_gt = None
+
+            # stack point clouds and move tensors to device
+            try:
+                point_clouds = torch.stack(point_clouds).to(device)
+            except Exception:
+                # if point_clouds already tensor
+                point_clouds = point_clouds.to(device)
+
+            if query_points is not None:
+                query_points = query_points.to(device)
+
+            if sdf_gt is not None:
+                sdf_gt = sdf_gt.to(device)
+
+            optimizer.zero_grad()
+
+            with autocast():
+                outputs = modulation_module(point_clouds, query_points) if query_points is not None else modulation_module(point_clouds)
+
+                # Attempt to extract commonly expected outputs. We support a few
+                # possible output shapes/ordering but expect at minimum: sdf_pred, z, latent_pc, x_recon, mu, logvar
+                sdf_pred = None
+                mu = None
+                logvar = None
+                recon = None
+                latent_pc = None
+
+                if isinstance(outputs, (tuple, list)):
+                    # find values by type/shape heuristics
+                    # common pattern: (sdf_pred, z, latent_pc, x_recon, mu, logvar)
+                    if len(outputs) >= 1:
+                        sdf_pred = outputs[0]
+                    if len(outputs) >= 3:
+                        latent_pc = outputs[2]
+                    if len(outputs) >= 5:
+                        mu = outputs[-2]
+                        logvar = outputs[-1]
+                    # try to find recon if present
+                    if len(outputs) >= 4:
+                        recon = outputs[3]
+                elif isinstance(outputs, dict):
+                    sdf_pred = outputs.get('sdf_pred') or outputs.get('sdf')
+                    mu = outputs.get('mu')
+                    logvar = outputs.get('logvar')
+                    recon = outputs.get('x_recon') or outputs.get('recon')
+                else:
+                    # single tensor output -> treat as sdf_pred
+                    sdf_pred = outputs
+
+                if sdf_pred is None:
+                    raise RuntimeError("modulation_module did not return an SDF prediction as first/only output")
+
+                if sdf_pred.dim() == 3:
+                    sdf_pred = sdf_pred.squeeze(-1)
+
+                # SDF loss
+                if sdf_gt is None:
+                    raise RuntimeError("Dataset must provide ground-truth SDFs for joint training")
+
+                sdf_loss, loss_dict = sdf_loss_function(sdf_pred, sdf_gt)
+
+                # KL loss (if mu/logvar available)
+                if (mu is not None) and (logvar is not None):
+                    sigma2 = logvar.exp()
+                    prior_var = prior_std ** 2
+                    kl_per_sample = 0.5 * ((sigma2 + mu.pow(2)) / prior_var - 1 - logvar + math.log(prior_var)).sum(dim=1)
+                    kl = kl_per_sample.mean()
+                else:
+                    kl = torch.tensor(0.0, device=sdf_loss.device)
+
+                # Combined loss: SDF + beta * KL
+                loss = sdf_loss + beta_kl * kl 
+
+                # optionally collect recon loss for logging
+                if recon is not None and 'latent_pc' in locals():
+                    try:
+                        recon_loss = F.mse_loss(recon, latent_pc, reduction='mean')
+                    except Exception:
+                        recon_loss = torch.tensor(0.0, device=loss.device)
+                else:
+                    recon_loss = torch.tensor(0.0, device=loss.device)
+                    loss = loss + 0.1*recon_loss
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            epoch_sdf_loss += sdf_loss.item()
+            epoch_kl_loss += (kl.item() if isinstance(kl, torch.Tensor) else float(kl))
+            epoch_recon_loss += (recon_loss.item() if isinstance(recon_loss, torch.Tensor) else float(recon_loss))
+
+        avg_sdf = epoch_sdf_loss / len(train_dataloader)
+        avg_kl = epoch_kl_loss / len(train_dataloader)
+        avg_recon = epoch_recon_loss / len(train_dataloader)
+
+        print(f"Epoch [{epoch + 1}/{total_epochs}] - SDF: {avg_sdf:.6f}, KL: {avg_kl:.6f}, Recon(logged): {avg_recon:.6f}")
+
+        # periodic checkpointing
+        if (epoch + 1) % 10 == 0:
+            save_checkpoint(modulation_module, optimizer, epoch, {'sdf': avg_sdf, 'kl': avg_kl}, os.path.join("checkpoints_mod", "mod_last.pth"))
+            save_checkpoint(modulation_module.vae, optimizer, epoch, {'recon': avg_recon, 'kl': avg_kl}, os.path.join("checkpoints_vae", "vae_last.pth"))
+
+        torch.cuda.empty_cache()
 
 def train_diffusion_model(diffusion_model, modulation_module, dataloader, optimizer, device, timesteps, betas, alphas_cumprod, num_epochs):
     modulation_module.eval()  # Freeze the modulation module
@@ -288,14 +420,14 @@ def main():
     print("Voxel grids constructed!")
     torch.cuda.empty_cache()  # After each step
     # Create the dataset and DataLoader
-    dataset = VoxelSDFDataset(voxel_grids, num_query_points=20000,fixed_surface_points_size=20000, noise_std=0.1, device=device)
-    train_dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
+    dataset = VoxelSDFDataset(voxel_grids, num_query_points=20000,fixed_surface_points_size=20000, noise_std=0.0, device=device)
+    train_dataloader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
     # modulation_module = ModulationModule(pointnet_input_dim=3, pointnet_output_dim=256, latent_dim=128).to(device)
-    vae = ImprovedVAE(input_dim=latent_dim, latent_dim=encoding_dim, hidden_dim=1024, num_layers=4).to(device)
-    sdf_network = ImprovedSDFNetwork(input_dim=encoding_dim, latent_dim = latent_dim, hidden_dim=512, output_dim=1, num_layers=4).to(device)
+    vae = ImprovedVAE(input_dim=latent_dim, latent_dim=encoding_dim, hidden_dim=1024, num_layers=8).to(device)
+    sdf_network = ImprovedSDFNetwork(input_dim=encoding_dim, latent_dim = latent_dim, hidden_dim=512, output_dim=1, num_layers=8).to(device)
     modulation_module = ModulationModule(vae, sdf_network).to(device)
     optimizer = torch.optim.Adam(modulation_module.parameters(), lr=1e-4)
-    staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1=50, num_epochs_stage_2=100)
+    staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1=25, num_epochs_stage_2=10000)
     torch.save(modulation_module.state_dict(), "modulation_module.pth")
 
 if __name__ == "__main__":

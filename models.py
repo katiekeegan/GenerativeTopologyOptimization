@@ -129,9 +129,14 @@ class ImprovedSDFNetwork(nn.Module):
 
         self.output_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.LeakyReLU(),
             nn.Linear(hidden_dim, 1),  # Output: [B, N, 1] (signed SDF)
-            nn.Tanh()
+            nn.Tanh(),
+            # NOTE: removed final nn.Tanh() so output is linear (raw SDF prediction).
+            # Using a linear output avoids saturating the network into [-1,1],
+            # which can cause training plateaus when targets don't occupy the
+            # full range. Keep no activation here and let the loss steer
+            # predictions to the normalized SDF target range.
         )
 
     def forward(self, query_points, latent):

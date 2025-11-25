@@ -12,7 +12,6 @@ from torch.cuda.amp import GradScaler, autocast
 import torch.nn.functional as F
 import math
 import os
-import argparse
 torch.cuda.empty_cache()  # After each step
 
 def sdf_loss_function(sdf_pred, sdf_gt):
@@ -24,72 +23,13 @@ def sdf_loss_function(sdf_pred, sdf_gt):
         total_loss (tensor), dict with components
     """
     # Ensure shapes: [B, N] or [B, N, 1] -> squeeze last dim
-    # Backwards-compatible signature: accept optional weights later via wrapper
     sdf_pred_clamped = sdf_pred
     sdf_gt_clamped = sdf_gt
 
     # L1 loss per the paper
     loss_l1 = F.l1_loss(sdf_pred_clamped.squeeze(), sdf_gt_clamped.squeeze(), reduction='mean')
 
-    return loss_l1, {"l1": loss_l1.item(), "mean_weight": 1.0}
-
-
-def compute_sdf_focus_weights(sdf_gt, mode='gauss', alpha=5.0, sigma=0.03, tau=0.05, eps=1e-6, max_weight=50.0, normalize=True):
-    """
-    Compute per-point importance weights biased toward |sdf_gt| ~ 0 (surface).
-
-    Args:
-        sdf_gt: Tensor [B, N] (normalized SDF)
-        mode: 'gauss' (recommended), 'linear', or 'inv'
-        alpha: strength multiplier for the bump
-        sigma: width for gaussian (used when mode='gauss')
-        tau: width for linear ramp (used when mode='linear')
-        max_weight: clamp to avoid extreme weights
-        normalize: if True, normalize per-sample mean weight to 1.0
-
-    Returns:
-        weights: Tensor [B, N]
-    """
-    sdf_abs = sdf_gt.abs()
-    if mode == 'gauss':
-        w = 1.0 + alpha * torch.exp(- (sdf_abs ** 2) / (2.0 * (sigma ** 2)))
-    elif mode == 'linear':
-        w = 1.0 + alpha * torch.clamp(1.0 - sdf_abs / (tau + eps), min=0.0)
-    elif mode == 'inv':
-        w = 1.0 + alpha / (sdf_abs + eps)
-    else:
-        raise ValueError(f"unknown focus mode {mode}")
-
-    if max_weight is not None:
-        w = torch.clamp(w, max=max_weight)
-
-    if normalize:
-        mean_w = w.mean(dim=1, keepdim=True)
-        w = w / (mean_w + 1e-8)
-
-    return w
-
-
-def sdf_loss_weighted(sdf_pred, sdf_gt, weights=None):
-    """Weighted L1 SDF loss. If weights is None, fallback to standard mean L1.
-
-    Returns (loss_tensor, dict)
-    """
-    sdf_pred = sdf_pred.squeeze()
-    sdf_gt = sdf_gt.squeeze()
-    if weights is None:
-        loss_l1 = F.l1_loss(sdf_pred, sdf_gt, reduction='mean')
-        mean_weight = 1.0
-    else:
-        err = (sdf_pred - sdf_gt).abs()
-        weights = weights.to(err.device, dtype=err.dtype)
-        weighted_sum = (weights * err).sum(dim=1)
-        denom = weights.sum(dim=1).clamp_min(1e-8)
-        per_sample = weighted_sum / denom
-        loss_l1 = per_sample.mean()
-        mean_weight = float(weights.mean().item())
-
-    return loss_l1, {"l1": loss_l1.item(), "mean_weight": mean_weight}
+    return loss_l1, {"l1": loss_l1.item()}
 
 def compute_sdf(query_points, surface_points, normals, epsilon=1e-8):
     """
@@ -156,15 +96,15 @@ def train_stage_1_vae(vae_module, train_dataloader, optimizer, device, num_epoch
                 # Reconstruction loss: keep for VAE training
                 recon_loss = F.mse_loss(x_recon, latent_pc, reduction='mean')
                 
-                # # KL divergence to N(0, prior_std^2)
-                # sigma2 = logvar.exp()
-                # prior_var = prior_std ** 2
-                # # KL per-sample
-                # kl_per_sample = 0.5 * ( (sigma2 + mu.pow(2)) / prior_var - 1 - logvar + math.log(prior_var) ).sum(dim=1)
-                # kl = kl_per_sample.mean()
+                # KL divergence to N(0, prior_std^2)
+                sigma2 = logvar.exp()
+                prior_var = prior_std ** 2
+                # KL per-sample
+                kl_per_sample = 0.5 * ( (sigma2 + mu.pow(2)) / prior_var - 1 - logvar + math.log(prior_var) ).sum(dim=1)
+                kl = kl_per_sample.mean()
                 
                 # Total VAE loss with small beta as described
-                loss = recon_loss # + beta_kl * kl
+                loss = recon_loss + beta_kl * kl
 
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(vae_module.parameters(), max_norm=1.0)
@@ -196,9 +136,7 @@ def train_stage_1_vae(vae_module, train_dataloader, optimizer, device, num_epoch
             save_checkpoint(vae_module, optimizer, epoch, checkpoint_loss, os.path.join(ckpt_dir, f"vae_epoch_{epoch}.pth"))
 
 
-def train_stage_2_modulation(modulation_module, train_dataloader, optimizer, device, num_epochs, ckpt_dir="checkpoints_mod", resume=False,
-                             sdf_focus=False, sdf_focus_alpha=5.0, sdf_focus_sigma=0.03, sdf_focus_mode='gauss',
-                             sdf_focus_max_weight=50.0, sdf_focus_normalize=True):
+def train_stage_2_modulation(modulation_module, train_dataloader, optimizer, device, num_epochs, ckpt_dir="checkpoints_mod", resume=False):
     """
     Stage 2: train modulation module for SDF prediction.
     Following the paragraph:
@@ -232,14 +170,8 @@ def train_stage_2_modulation(modulation_module, train_dataloader, optimizer, dev
                 if sdf_pred.dim() == 3:
                     sdf_pred = sdf_pred.squeeze(-1)
 
-                # Per-paper SDF loss (L1) or weighted variant
-                if sdf_focus and (sdf_gt is not None):
-                    weights = compute_sdf_focus_weights(sdf_gt, mode=sdf_focus_mode,
-                                                        alpha=sdf_focus_alpha, sigma=sdf_focus_sigma,
-                                                        max_weight=sdf_focus_max_weight, normalize=sdf_focus_normalize)
-                    loss, loss_dict = sdf_loss_weighted(sdf_pred, sdf_gt, weights=weights)
-                else:
-                    loss, loss_dict = sdf_loss_function(sdf_pred, sdf_gt)
+                # Per-paper SDF loss (L1)
+                loss, loss_dict = sdf_loss_function(sdf_pred, sdf_gt)
                 
                 # IMPORTANT: do NOT add a VAE reconstruction loss here (per the paragraph)
 
@@ -261,10 +193,7 @@ def train_stage_2_modulation(modulation_module, train_dataloader, optimizer, dev
 #     """
 #     Full staged training pipeline.
 #     """
-def staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1, num_epochs_stage_2, beta_kl=1e-4, prior_std=0.25, lr=1e-4,
-                    sdf_focus=False, sdf_focus_alpha=5.0, sdf_focus_sigma=0.03, sdf_focus_mode='gauss',
-                    sdf_focus_max_weight=50.0, sdf_focus_normalize=True,
-                    sdf_sign_loss=False, sdf_sign_gamma=1.0, sdf_sign_margin=0.01, sdf_sign_threshold=0.03):
+def staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1, num_epochs_stage_2, beta_kl=1e-4, prior_std=0.25, lr=1e-4):
     """
     Joint training loop that optimizes the SDF L1 loss and the VAE KL regularizer
     together. The function runs for `num_epochs_stage_1 + num_epochs_stage_2` epochs
@@ -291,9 +220,6 @@ def staged_training(modulation_module, train_dataloader, device, num_epochs_stag
         epoch_sdf_loss = 0.0
         epoch_kl_loss = 0.0
         epoch_recon_loss = 0.0
-        epoch_sign_loss = 0.0
-        epoch_mean_weight = 0.0
-        epoch_weight_batches = 0
 
         for batch_idx, batch in enumerate(train_dataloader):
             # Expect batches like (point_clouds, query_points, sdf_gt)
@@ -366,16 +292,7 @@ def staged_training(modulation_module, train_dataloader, device, num_epochs_stag
                 if sdf_gt is None:
                     raise RuntimeError("Dataset must provide ground-truth SDFs for joint training")
 
-                if sdf_focus and (sdf_gt is not None):
-                    weights = compute_sdf_focus_weights(sdf_gt, mode=sdf_focus_mode,
-                                                        alpha=sdf_focus_alpha, sigma=sdf_focus_sigma,
-                                                        max_weight=sdf_focus_max_weight, normalize=sdf_focus_normalize)
-                    sdf_loss, loss_dict = sdf_loss_weighted(sdf_pred, sdf_gt, weights=weights)
-                    # accumulate mean weight for logging
-                    epoch_mean_weight += float(loss_dict.get('mean_weight', 1.0))
-                    epoch_weight_batches += 1
-                else:
-                    sdf_loss, loss_dict = sdf_loss_function(sdf_pred, sdf_gt)
+                sdf_loss, loss_dict = sdf_loss_function(sdf_pred, sdf_gt)
 
                 # KL loss (if mu/logvar available)
                 if (mu is not None) and (logvar is not None):
@@ -386,22 +303,8 @@ def staged_training(modulation_module, train_dataloader, device, num_epochs_stag
                 else:
                     kl = torch.tensor(0.0, device=sdf_loss.device)
 
-                # Optional: sign-consistency hinge loss (penalize sign flips near interface)
-                sign_loss = torch.tensor(0.0, device=sdf_loss.device)
-                # sign-loss is kept external and configurable via CLI (see main)
-                if sdf_sign_loss:
-                    # mask points near true surface
-                    mask = (sdf_gt.abs() <= sdf_sign_threshold)
-                    if mask.any():
-                        prod = sdf_pred * sdf_gt
-                        # hinge penalty when prod is negative (opposite sign) or below margin
-                        hinge = F.relu(-prod + sdf_sign_margin)
-                        # only consider masked points
-                        hinge_masked = hinge[mask]
-                        if hinge_masked.numel() > 0:
-                            sign_loss = hinge_masked.mean()
-                # Combined loss: SDF + beta * KL + sign term
-                loss = sdf_loss + sdf_sign_gamma * sign_loss
+                # Combined loss: SDF + beta * KL
+                loss = sdf_loss + beta_kl * kl 
 
                 # optionally collect recon loss for logging
                 if recon is not None and 'latent_pc' in locals():
@@ -420,22 +323,19 @@ def staged_training(modulation_module, train_dataloader, device, num_epochs_stag
             epoch_sdf_loss += sdf_loss.item()
             epoch_kl_loss += (kl.item() if isinstance(kl, torch.Tensor) else float(kl))
             epoch_recon_loss += (recon_loss.item() if isinstance(recon_loss, torch.Tensor) else float(recon_loss))
-            epoch_sign_loss += (sign_loss.item() if isinstance(sign_loss, torch.Tensor) else float(sign_loss))
 
         avg_sdf = epoch_sdf_loss / len(train_dataloader)
         avg_kl = epoch_kl_loss / len(train_dataloader)
         avg_recon = epoch_recon_loss / len(train_dataloader)
 
-        if epoch_weight_batches > 0:
-            avg_mean_weight = epoch_mean_weight / epoch_weight_batches
-            print(f"Epoch [{epoch + 1}/{total_epochs}] - SDF: {avg_sdf:.6f}, KL: {avg_kl:.6f}, Recon(logged): {avg_recon:.6f}, sign_loss: {epoch_sign_loss/len(train_dataloader):.6f}, mean_weight: {avg_mean_weight:.4f}")
-        else:
-            print(f"Epoch [{epoch + 1}/{total_epochs}] - SDF: {avg_sdf:.6f}, KL: {avg_kl:.6f}, Recon(logged): {avg_recon:.6f}, sign_loss: {epoch_sign_loss/len(train_dataloader):.6f}")
+        print(f"Epoch [{epoch + 1}/{total_epochs}] - SDF: {avg_sdf:.6f}, KL: {avg_kl:.6f}, Recon(logged): {avg_recon:.6f}")
 
         # periodic checkpointing
         if (epoch + 1) % 10 == 0:
             save_checkpoint(modulation_module, optimizer, epoch, {'sdf': avg_sdf, 'kl': avg_kl}, os.path.join("checkpoints_mod", "mod_last.pth"))
-            save_checkpoint(modulation_module.vae, optimizer, epoch, {'recon': avg_recon, 'kl': avg_kl}, os.path.join("checkpoints_vae", "vae_last.pth"))
+            # Save VAE model state only (do not reuse modulation optimizer state)
+            vae_ckpt = {'model_state_dict': modulation_module.vae.state_dict(), 'epoch': epoch, 'loss': {'recon': avg_recon, 'kl': avg_kl}}
+            torch.save(vae_ckpt, os.path.join("checkpoints_vae", "vae_last.pth"))
 
         torch.cuda.empty_cache()
 
@@ -501,10 +401,10 @@ def load_checkpoint(model, optimizer, filename, device):
 def main():
     # train_modulation_module = True
     # Training hyperparameters
-    encoding_dim = 256
-    latent_dim = 64
+    encoding_dim = 128
+    latent_dim = 1024
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_epochs = 10000
+    num_epochs = 1000
     learning_rate = 1e-4
     diffusion_steps = 100
     # Example usage
@@ -522,65 +422,14 @@ def main():
     print("Voxel grids constructed!")
     torch.cuda.empty_cache()  # After each step
     # Create the dataset and DataLoader
-    dataset = VoxelSDFDataset(voxel_grids, num_query_points=5000,fixed_surface_points_size=10000, noise_std=0.1, device=device)
-
-    # Quick diagnostics: compute mins/maxes/means across the stored SDF grids
-    try:
-        print("Computing SDF grid statistics from VoxelSDFDataset.sdf_grids...")
-        all_mins = [float(g.min().item()) for g in dataset.sdf_grids]
-        all_maxs = [float(g.max().item()) for g in dataset.sdf_grids]
-        all_means = [float(g.mean().item()) for g in dataset.sdf_grids]
-        global_min = float(np.min(all_mins)) if len(all_mins) > 0 else float('nan')
-        global_max = float(np.max(all_maxs)) if len(all_maxs) > 0 else float('nan')
-        mean_of_means = float(np.mean(all_means)) if len(all_means) > 0 else float('nan')
-        print(f"SDF grids: count={len(all_mins)}, global_min={global_min:.6f}, global_max={global_max:.6f}, mean_of_means={mean_of_means:.6f}")
-
-        # Also show normalized stats by dataset.sdf_scale if available
-        sdf_scale = getattr(dataset, 'sdf_scale', None)
-        if sdf_scale is not None and sdf_scale != 0:
-            norm_mins = [m / float(sdf_scale) for m in all_mins]
-            norm_maxs = [M / float(sdf_scale) for M in all_maxs]
-            print(f"Normalized by sdf_scale={sdf_scale:.6f}: norm_global_min={float(np.min(norm_mins)):.6f}, norm_global_max={float(np.max(norm_maxs)):.6f}")
-    except Exception as e:
-        print(f"[trainer] Warning: failed to compute SDF grid statistics: {e}")
-
-    train_dataloader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
+    dataset = VoxelSDFDataset(voxel_grids, num_query_points=10000,fixed_surface_points_size=10000, noise_std=0.1, device=device)
+    train_dataloader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_fn)
     # modulation_module = ModulationModule(pointnet_input_dim=3, pointnet_output_dim=256, latent_dim=128).to(device)
-    # Correct shapes: VAE input_dim == feature size produced by PointNet (encoding_dim)
-    # and VAE latent_dim == compressed z-size (latent_dim). The SDF network is
-    # conditioned on the VAE decoder output (x_recon) which has size == encoding_dim,
-    # therefore sdf_network.latent_dim should be encoding_dim (conditioning vector size).
-    vae = ImprovedVAE(input_dim=encoding_dim, latent_dim=latent_dim, hidden_dim=512, num_layers=8).to(device)
-    sdf_network = ImprovedSDFNetwork(input_dim=encoding_dim, latent_dim=encoding_dim, hidden_dim=128, output_dim=1, num_layers=8).to(device)
+    vae = ImprovedVAE(input_dim=latent_dim, latent_dim=encoding_dim, hidden_dim=1024, num_layers=8).to(device)
+    sdf_network = ImprovedSDFNetwork(input_dim=encoding_dim, latent_dim = latent_dim, hidden_dim=512, output_dim=1, num_layers=8).to(device)
     modulation_module = ModulationModule(vae, sdf_network).to(device)
     optimizer = torch.optim.Adam(modulation_module.parameters(), lr=1e-4)
-    # parse optional CLI args for SDF focus weighting (defaults keep original behavior)
-    parser = argparse.ArgumentParser(description='Train modulation module with optional SDF focus weighting')
-    parser.add_argument('--sdf_focus', action='store_true', help='Enable focus weighting toward SDF zero-crossing')
-    parser.add_argument('--sdf_focus_alpha', type=float, default=5.0, help='Alpha multiplier for focus bump')
-    parser.add_argument('--sdf_focus_sigma', type=float, default=0.03, help='Gaussian sigma (normalized SDF units)')
-    parser.add_argument('--sdf_focus_mode', type=str, default='gauss', choices=['gauss', 'linear', 'inv'], help='Weighting mode')
-    parser.add_argument('--sdf_focus_max_weight', type=float, default=50.0, help='Max clamp for per-point weight')
-    parser.add_argument('--no_sdf_focus_normalize', dest='sdf_focus_normalize', action='store_false', help='Disable per-sample normalization of weights')
-    parser.set_defaults(sdf_focus_normalize=True)
-    # optional sign-consistency hinge loss to encourage correct sign near interface
-    parser.add_argument('--sdf_sign_loss', action='store_true', help='Enable hinge-style sign consistency loss near SDF=0')
-    parser.add_argument('--sdf_sign_gamma', type=float, default=1.0, help='Weight for sign-consistency loss term')
-    parser.add_argument('--sdf_sign_margin', type=float, default=0.01, help='Margin used in hinge for sign loss')
-    parser.add_argument('--sdf_sign_threshold', type=float, default=0.1, help='Consider points with |sdf_gt| <= threshold for sign loss')
-    args, unknown = parser.parse_known_args()
-
-    staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1=25, num_epochs_stage_2=2000, beta_kl=1e-5,
-                    sdf_focus=args.sdf_focus,
-                    sdf_focus_alpha=args.sdf_focus_alpha,
-                    sdf_focus_sigma=args.sdf_focus_sigma,
-                    sdf_focus_mode=args.sdf_focus_mode,
-                    sdf_focus_max_weight=args.sdf_focus_max_weight,
-                    sdf_focus_normalize=args.sdf_focus_normalize,
-                    sdf_sign_loss=args.sdf_sign_loss,
-                    sdf_sign_gamma=args.sdf_sign_gamma,
-                    sdf_sign_margin=args.sdf_sign_margin,
-                    sdf_sign_threshold=args.sdf_sign_threshold)
+    staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1=25, num_epochs_stage_2=1000)
     torch.save(modulation_module.state_dict(), "modulation_module.pth")
 
 if __name__ == "__main__":

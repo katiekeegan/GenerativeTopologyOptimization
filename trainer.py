@@ -127,136 +127,6 @@ def compute_sdf(query_points, surface_points, normals, epsilon=1e-8):
     # 6. Final SDF [B, N]
     return (min_dist * sign).squeeze()
 
-def train_stage_1_vae(vae_module, train_dataloader, optimizer, device, num_epochs, ckpt_dir="checkpoints_vae", resume=False, beta_kl=1e-4, prior_std=0.25):
-    """
-    Stage 1: train VAE. Keeps reconstruction loss but uses KL that regularizes
-    q(z|pi) toward N(0, prior_std^2) and weights KL by beta_kl (default 1e-5 per paragraph).
-    """
-    vae_module.train()
-    scaler = GradScaler()
-    scheduler = StepLR(optimizer, step_size=20, gamma=0.1)
-    os.makedirs(ckpt_dir, exist_ok=True)
-    start_epoch = 0
-
-    ckpt_path = os.path.join(ckpt_dir, "vae_last.pth")
-    if resume and os.path.exists(ckpt_path):
-        start_epoch, _ = load_checkpoint(vae_module, optimizer, ckpt_path, device)
-
-    for epoch in range(start_epoch, num_epochs):
-        total_recon_loss = 0.0
-        total_kl_loss = 0.0
-        
-        for batch_idx, (point_clouds, query_points, _) in enumerate(train_dataloader):
-            point_clouds = torch.stack(point_clouds).to(device)
-            optimizer.zero_grad()
-
-            with autocast():
-                # VAE forward pass: returns (x_recon, z, latent_pc, mu, logvar)
-                x_recon, z, latent_pc, mu, logvar = vae_module(point_clouds)
-                # Reconstruction loss: keep for VAE training
-                recon_loss = F.mse_loss(x_recon, latent_pc, reduction='mean')
-                
-                # # KL divergence to N(0, prior_std^2)
-                # sigma2 = logvar.exp()
-                # prior_var = prior_std ** 2
-                # # KL per-sample
-                # kl_per_sample = 0.5 * ( (sigma2 + mu.pow(2)) / prior_var - 1 - logvar + math.log(prior_var) ).sum(dim=1)
-                # kl = kl_per_sample.mean()
-                
-                # Total VAE loss with small beta as described
-                loss = recon_loss # + beta_kl * kl
-
-            scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(vae_module.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-
-            total_recon_loss += recon_loss.item()
-            total_kl_loss += kl.item()
-
-        avg_recon_loss = total_recon_loss / len(train_dataloader)
-        avg_kl_loss = total_kl_loss / len(train_dataloader)
-        avg_total_loss = avg_recon_loss + beta_kl * avg_kl_loss
-        
-        print(f"Stage 1 - Epoch [{epoch + 1}/{num_epochs}], "
-              f"Total Loss: {avg_total_loss:.6f}, "
-              f"Recon Loss: {avg_recon_loss:.6f}, "
-              f"KL Loss: {avg_kl_loss:.6f}, "
-              f"Beta: {beta_kl:.6e}")
-        scheduler.step()
-
-        if (epoch + 1) % 10 == 0:
-            checkpoint_loss = {
-                'total': avg_total_loss,
-                'recon': avg_recon_loss,
-                'kl': avg_kl_loss,
-                'beta': beta_kl
-            }
-            save_checkpoint(vae_module, optimizer, epoch, checkpoint_loss, os.path.join(ckpt_dir, "vae_last.pth"))
-            save_checkpoint(vae_module, optimizer, epoch, checkpoint_loss, os.path.join(ckpt_dir, f"vae_epoch_{epoch}.pth"))
-
-
-def train_stage_2_modulation(modulation_module, train_dataloader, optimizer, device, num_epochs, ckpt_dir="checkpoints_mod", resume=False,
-                             sdf_focus=False, sdf_focus_alpha=5.0, sdf_focus_sigma=0.03, sdf_focus_mode='gauss',
-                             sdf_focus_max_weight=50.0, sdf_focus_normalize=True):
-    """
-    Stage 2: train modulation module for SDF prediction.
-    Following the paragraph:
-      - Use L1 loss between predicted and GT SDF for query points
-      - Do NOT add a VAE reconstruction loss term here
-      - KL regularization is part of the VAE (stage 1) and is already applied there
-    """
-    modulation_module.train()
-    scaler = GradScaler()
-    os.makedirs(ckpt_dir, exist_ok=True)
-    start_epoch = 0
-
-    ckpt_path = os.path.join(ckpt_dir, "mod_last.pth")
-    if resume and os.path.exists(ckpt_path):
-        start_epoch, _ = load_checkpoint(modulation_module, optimizer, ckpt_path, device)
-
-    for epoch in range(start_epoch, num_epochs):
-        total_loss = 0.0
-        for batch_idx, (point_clouds, query_points, sdf_gt) in enumerate(train_dataloader):
-            point_clouds = torch.stack(point_clouds).to(device)
-            query_points = query_points.to(device)
-            sdf_gt = sdf_gt.to(device)
-
-            optimizer.zero_grad()
-
-            with autocast():
-                # modulation_module returns (sdf_pred, z, latent_pc, x_recon, mu, logvar) or similar
-                outputs = modulation_module(point_clouds, query_points)
-                sdf_pred = outputs[0]
-                # other outputs are available if needed
-                if sdf_pred.dim() == 3:
-                    sdf_pred = sdf_pred.squeeze(-1)
-
-                # Per-paper SDF loss (L1) or weighted variant
-                if sdf_focus and (sdf_gt is not None):
-                    weights = compute_sdf_focus_weights(sdf_gt, mode=sdf_focus_mode,
-                                                        alpha=sdf_focus_alpha, sigma=sdf_focus_sigma,
-                                                        max_weight=sdf_focus_max_weight, normalize=sdf_focus_normalize)
-                    loss, loss_dict = sdf_loss_weighted(sdf_pred, sdf_gt, weights=weights)
-                else:
-                    loss, loss_dict = sdf_loss_function(sdf_pred, sdf_gt)
-                
-                # IMPORTANT: do NOT add a VAE reconstruction loss here (per the paragraph)
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            total_loss += loss.item()
-
-        avg_loss = total_loss / len(train_dataloader)
-        print(f"Stage 2 - Epoch [{epoch + 1}/{num_epochs}] - Total Loss: {avg_loss:.6f}")
-
-        if (epoch + 1) % 100 == 0:
-            save_checkpoint(modulation_module, optimizer, epoch, avg_loss, os.path.join(ckpt_dir, "mod_last.pth"))
-            save_checkpoint(modulation_module, optimizer, epoch, avg_loss, os.path.join(ckpt_dir, f"mod_epoch_{epoch}.pth"))
-
-
-
 # def staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1, num_epochs_stage_2):
 #     """
 #     Full staged training pipeline.
@@ -570,7 +440,7 @@ def main():
     parser.add_argument('--sdf_sign_threshold', type=float, default=0.1, help='Consider points with |sdf_gt| <= threshold for sign loss')
     args, unknown = parser.parse_known_args()
 
-    staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1=25, num_epochs_stage_2=2000, beta_kl=1e-5,
+    staged_training(modulation_module, train_dataloader, device, num_epochs= num_epochs, beta_kl=1e-5,
                     sdf_focus=args.sdf_focus,
                     sdf_focus_alpha=args.sdf_focus_alpha,
                     sdf_focus_sigma=args.sdf_focus_sigma,

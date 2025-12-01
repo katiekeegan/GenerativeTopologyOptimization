@@ -91,10 +91,14 @@ def extract_z_from_vae(modulation_module, point_clouds: torch.Tensor, device: to
 
 
 def sinusoidal_timestep_embedding(timesteps, dim: int):
+    # Ensure all tensors are created on the same device as `timesteps` to avoid device mismatch
+    device = timesteps.device
     half = dim // 2
-    emb = math.log(10000) / (half - 1)
-    emb = torch.exp(torch.arange(half, dtype=torch.float32) * -emb)
-    emb = timesteps.float().unsqueeze(1) * emb.unsqueeze(0)
+    # build frequency bands on the correct device
+    log_max = math.log(10000.0)
+    inv_freq = torch.exp(torch.arange(half, device=device, dtype=torch.float32) * -(log_max / (half - 1)))
+    t = timesteps.float().unsqueeze(1).to(device)
+    emb = t * inv_freq.unsqueeze(0)
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
     if dim % 2 == 1:  # zero pad
         emb = F.pad(emb, (0, 1, 0, 0))
@@ -105,6 +109,7 @@ class MLPDiffusionModel(nn.Module):
     """Simple MLP that predicts noise in latent space, conditioned on timestep embedding."""
     def __init__(self, latent_dim: int, hidden: int = 512, time_emb_dim: int = 128):
         super().__init__()
+        self.time_emb_dim = time_emb_dim
         self.time_mlp = nn.Sequential(
             nn.Linear(time_emb_dim, time_emb_dim),
             nn.ReLU(),
@@ -120,7 +125,7 @@ class MLPDiffusionModel(nn.Module):
 
     def forward(self, x: torch.Tensor, t: torch.Tensor):
         # x: [B, latent_dim], t: [B] ints
-        t_emb = sinusoidal_timestep_embedding(t, self.time_mlp[0].in_features if hasattr(self.time_mlp[0], 'in_features') else 128)
+        t_emb = sinusoidal_timestep_embedding(t, self.time_emb_dim)
         t_emb = t_emb.to(x.device)
         t_emb = self.time_mlp(t_emb)
         h = torch.cat([x, t_emb], dim=1)

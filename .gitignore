@@ -13,3 +13,4 @@ utils/sphere_complex
 dl4to/
 checkpoints_vae/
 checkpoints_mod/
+*.sh

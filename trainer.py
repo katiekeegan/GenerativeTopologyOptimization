@@ -131,22 +131,20 @@ def compute_sdf(query_points, surface_points, normals, epsilon=1e-8):
 #     """
 #     Full staged training pipeline.
 #     """
-def staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1, num_epochs_stage_2, beta_kl=1e-4, prior_std=0.25, lr=1e-4,
+def staged_training(modulation_module, train_dataloader, device, num_epochs =10000, beta_kl=1e-4, prior_std=0.25, lr=1e-4,
                     sdf_focus=False, sdf_focus_alpha=5.0, sdf_focus_sigma=0.03, sdf_focus_mode='gauss',
                     sdf_focus_max_weight=50.0, sdf_focus_normalize=True,
                     sdf_sign_loss=False, sdf_sign_gamma=1.0, sdf_sign_margin=0.01, sdf_sign_threshold=0.03):
     """
     Joint training loop that optimizes the SDF L1 loss and the VAE KL regularizer
-    together. The function runs for `num_epochs_stage_1 + num_epochs_stage_2` epochs
-    but performs the same joint update every epoch (so effectively it's a single
-    training loop that lasts `total_epochs`).
+    together. The function runs for `num_epochs` epochs.
 
     Per-batch loss: L = L_sdf + beta_kl * KL(q(z|x) || N(0, prior_std^2)).
     We do NOT include the VAE reconstruction loss in the default joint objective
     to match the paper's Stage-2 emphasis unless the network explicitly returns
     a recon and you want to include it (we still log it if available).
     """
-    total_epochs = int(num_epochs_stage_1) + int(num_epochs_stage_2)
+    total_epochs = num_epochs
 
     optimizer = optim.Adam(modulation_module.parameters(), lr=lr)
     scaler = GradScaler()
@@ -435,7 +433,7 @@ def main():
     parser.set_defaults(sdf_focus_normalize=True)
     # optional sign-consistency hinge loss to encourage correct sign near interface
     parser.add_argument('--sdf_sign_loss', action='store_true', help='Enable hinge-style sign consistency loss near SDF=0')
-    parser.add_argument('--sdf_sign_gamma', type=float, default=1.0, help='Weight for sign-consistency loss term')
+    parser.add_argument('--sdf_sign_gamma', type=float, default=100.0, help='Weight for sign-consistency loss term')
     parser.add_argument('--sdf_sign_margin', type=float, default=0.01, help='Margin used in hinge for sign loss')
     parser.add_argument('--sdf_sign_threshold', type=float, default=0.1, help='Consider points with |sdf_gt| <= threshold for sign loss')
     args, unknown = parser.parse_known_args()

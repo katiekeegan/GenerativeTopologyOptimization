@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a DDPM in the VAE latent space.
+"""Train a score-based diffusion model in the VAE latent space.
 
 This script mirrors the checkpoint-loading robustness from `sample_sdf_obj.py`.
 It extracts latents z from the modulation module's VAE (using common output orders),
@@ -25,15 +25,24 @@ from dl4to.datasets import SELTODataset
 from utils.preprocess_data import create_voxel_grids, VoxelSDFDataset, collate_fn, create_problem_information_lists
 
 
-def cosine_beta_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
-    """Cosine schedule as in Nichol & Dhariwal implementation.
-    Returns betas tensor shape [timesteps]."""
-    steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps)
-    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return torch.clip(betas, 0.0001, 0.9999)
+def ve_sigma_schedule(t_min: float, t_max: float):
+    """Return helpers for a Variance-Exploding (VE) SDE noise schedule.
+    We parameterize sigma(t) = sigma_min * (sigma_max/sigma_min) ** t, with t in [0,1].
+    """
+    sigma_min = t_min
+    sigma_max = t_max
+
+    def sigma_from_t(t: torch.Tensor) -> torch.Tensor:
+        # t ∈ [0,1], sigma(t) = sigma_min * exp(log(sigma_max/sigma_min) * t)
+        return sigma_min * torch.exp(torch.log(torch.tensor(sigma_max / sigma_min, device=t.device)) * t)
+
+    def embed_t_for_time(t: torch.Tensor) -> torch.Tensor:
+        # Use log sigma as the embedding input to sinusoidal_timestep_embedding
+        sig = sigma_from_t(t)
+        log_sig = torch.log(sig)
+        return log_sig
+
+    return sigma_from_t, embed_t_for_time
 
 
 def extract_z_from_vae(modulation_module, point_clouds: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -130,9 +139,9 @@ class MLPDiffusionModel(nn.Module):
             nn.Linear(hidden, latent_dim),
         )
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor | None = None):
-        # x: [B, latent_dim], t: [B] ints, cond: [B, C_cond, D, H, W] or None
-        t_emb = sinusoidal_timestep_embedding(t, self.time_emb_dim)
+    def forward(self, x: torch.Tensor, t_embed: torch.Tensor, cond: torch.Tensor | None = None):
+        # x: [B, latent_dim], t_embed: [B] real-valued (e.g., log-sigma), cond: [B, C_cond, D, H, W] or None
+        t_emb = sinusoidal_timestep_embedding(t_embed, self.time_emb_dim)
         t_emb = t_emb.to(x.device)
         t_emb = self.time_mlp(t_emb)
 
@@ -148,25 +157,22 @@ class MLPDiffusionModel(nn.Module):
             cond_vec = cond_vec.to(x.device)
             h = torch.cat([x, t_emb, cond_vec], dim=1)
         else:
-            h = torch.cat([x, t_emb], dim=1)
+            # If the network was initialized with a cond_dim, but no cond is provided,
+            # pad zeros so the input dimension matches.
+            if self.cond_dim is not None and self.cond_dim > 0:
+                cond_vec = torch.zeros(x.size(0), self.cond_dim, device=x.device, dtype=x.dtype)
+                h = torch.cat([x, t_emb, cond_vec], dim=1)
+            else:
+                h = torch.cat([x, t_emb], dim=1)
 
         return self.net(h)
 
 
-def forward_process(z0: torch.Tensor, t: torch.Tensor, betas: torch.Tensor, alphas_cumprod: torch.Tensor):
-    """Add noise to z0 at timestep t. Returns z_t and the noise epsilon used."""
-    device = z0.device
-    betas = betas.to(device)
-    alphas_cumprod = alphas_cumprod.to(device)
-    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
-    sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
-
-    # gather per-sample
-    sqrt_ac = sqrt_alphas_cumprod[t].unsqueeze(1)
-    sqrt_om = sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)
-
+def ve_forward_noising(z0: torch.Tensor, sigma: torch.Tensor):
+    """Add VE-SDE noise: z_t = z0 + sigma * noise.
+    Returns z_t and the noise epsilon used."""
     noise = torch.randn_like(z0)
-    z_t = sqrt_ac * z0 + sqrt_om * noise
+    z_t = z0 + sigma.unsqueeze(1) * noise
     return z_t, noise
 
 
@@ -204,16 +210,14 @@ def train(args):
         dataset = VoxelSDFDataset(voxel_grids, num_query_points=args.num_query_points, fixed_surface_points_size=args.fixed_surface_points_size, noise_std=0.0, device=device)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
 
-    # diffusion model
+    # diffusion model (score-based)
     # If conditioning, infer cond_dim from dataset's conditioning channels (C_cond=8 in current SELTO processing)
     cond_dim = 8 if args.cond else None
     diffusion = MLPDiffusionModel(latent_dim=args.latent_dim, hidden=args.hidden_dim, time_emb_dim=args.time_emb_dim, cond_dim=cond_dim).to(device)
     optimizer = optim.Adam(diffusion.parameters(), lr=args.lr)
 
-    # schedules
-    betas = cosine_beta_schedule(args.timesteps).to(device)
-    alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0).to(device)
+    # VE schedule helpers
+    sigma_from_t, embed_t_for_time = ve_sigma_schedule(args.sigma_min, args.sigma_max)
 
     global_step = 0
     for epoch in range(args.epochs):
@@ -249,14 +253,19 @@ def train(args):
             # ensure z is [B, latent_dim]
             z = z.view(z.size(0), -1)
 
-            # sample timesteps per sample
-            t = torch.randint(0, args.timesteps, (z.size(0),), device=device)
-
-            z_t, noise = forward_process(z, t, betas, alphas_cumprod)
+            # sample continuous times t ∈ [0,1]
+            t = torch.rand(z.size(0), device=device)
+            sigma = sigma_from_t(t)
+            z_t, noise = ve_forward_noising(z, sigma)
 
             optimizer.zero_grad()
-            predicted = diffusion(z_t, t, cond=batch_cond)
-            loss = F.mse_loss(predicted, noise)
+            # Use log-sigma embedding for time
+            t_embed = embed_t_for_time(t)
+            predicted_score = diffusion(z_t, t_embed, cond=batch_cond)
+            # Target score for VE: s* = - noise / sigma
+            target_score = - noise / sigma.unsqueeze(1)
+            # Optional weighting lambda(t): sigma^2 (to balance scales). Here we use simple MSE on score.
+            loss = F.mse_loss(predicted_score, target_score)
             loss.backward()
             optimizer.step()
 
@@ -290,7 +299,9 @@ def parse_args():
     parser.add_argument('--fixed-surface-points-size', type=int, default=5000)
     parser.add_argument('--encoding-dim', type=int, default=256)
     parser.add_argument('--latent-dim', type=int, default=64)
-    parser.add_argument('--timesteps', type=int, default=1000)
+    # score-based (VE) schedule params
+    parser.add_argument('--sigma-min', type=float, default=0.01)
+    parser.add_argument('--sigma-max', type=float, default=1.0)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-4)

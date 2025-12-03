@@ -67,7 +67,7 @@ class VoxelSDFDataset(Dataset):
             self.sdf_grids.append(self._get_signed_distance_grid(vg.numpy()))
 
         if self.problem_information_list is not None:
-            assert len(self.problem_information_list) == len(self.voxel_grids), "Length of problem_information_list must match number of voxel grids"
+            assert len(self.problem_information_list[0]) == len(self.voxel_grids), "Length of problem_information_list must match number of voxel grids"
             if self.dataset is not None:
                 self.dataset = 'SELTO'
             if self.dataset == 'SELTO':

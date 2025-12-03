@@ -11,7 +11,7 @@ Usage (example):
 import os
 import argparse
 import math
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from models import ImprovedVAE, ImprovedSDFNetwork, ModulationModule
 from dl4to.datasets import SELTODataset
-from utils.preprocess_data import create_voxel_grids, VoxelSDFDataset, collate_fn
+from utils.preprocess_data import create_voxel_grids, VoxelSDFDataset, collate_fn, create_problem_information_lists
 
 
 def cosine_beta_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
@@ -106,29 +106,50 @@ def sinusoidal_timestep_embedding(timesteps, dim: int):
 
 
 class MLPDiffusionModel(nn.Module):
-    """Simple MLP that predicts noise in latent space, conditioned on timestep embedding."""
-    def __init__(self, latent_dim: int, hidden: int = 512, time_emb_dim: int = 128):
+    """Simple MLP that predicts noise in latent space.
+    Supports optional conditioning via a spatial grid cond: [B, C_cond, D, H, W].
+    The conditioning is pooled to a vector and concatenated to inputs.
+    """
+    def __init__(self, latent_dim: int, hidden: int = 512, time_emb_dim: int = 128, cond_dim: Optional[int] = None):
         super().__init__()
         self.time_emb_dim = time_emb_dim
+        self.cond_dim = cond_dim
+
         self.time_mlp = nn.Sequential(
             nn.Linear(time_emb_dim, time_emb_dim),
             nn.ReLU(),
             nn.Linear(time_emb_dim, time_emb_dim),
         )
+
+        in_dim = latent_dim + time_emb_dim + (cond_dim or 0)
         self.net = nn.Sequential(
-            nn.Linear(latent_dim + time_emb_dim, hidden),
+            nn.Linear(in_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, latent_dim),
         )
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor):
-        # x: [B, latent_dim], t: [B] ints
+    def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor | None = None):
+        # x: [B, latent_dim], t: [B] ints, cond: [B, C_cond, D, H, W] or None
         t_emb = sinusoidal_timestep_embedding(t, self.time_emb_dim)
         t_emb = t_emb.to(x.device)
         t_emb = self.time_mlp(t_emb)
-        h = torch.cat([x, t_emb], dim=1)
+
+        if cond is not None:
+            # Global average pool over spatial dims -> [B, C_cond]
+            if cond.dim() == 5:
+                cond_vec = cond.mean(dim=(-1, -2, -3))
+            elif cond.dim() == 2:
+                cond_vec = cond
+            else:
+                # Fallback: flatten last dims to vector
+                cond_vec = cond.view(cond.size(0), -1)
+            cond_vec = cond_vec.to(x.device)
+            h = torch.cat([x, t_emb, cond_vec], dim=1)
+        else:
+            h = torch.cat([x, t_emb], dim=1)
+
         return self.net(h)
 
 
@@ -176,11 +197,17 @@ def train(args):
     print("Loading SELTO dataset and creating voxel grids...")
     selto = SELTODataset(root='.', name=args.dataset_name, train=True)
     voxel_grids = create_voxel_grids(selto)
-    dataset = VoxelSDFDataset(voxel_grids, num_query_points=args.num_query_points, fixed_surface_points_size=args.fixed_surface_points_size, noise_std=0.0, device=device)
+    if args.cond:
+        F_list, Ω_design_list = create_problem_information_lists(selto)
+        dataset = VoxelSDFDataset(voxel_grids, problem_information_list = [F_list, Ω_design_list], num_query_points=args.num_query_points, fixed_surface_points_size=args.fixed_surface_points_size, noise_std=0.0, device=device)
+    else:
+        dataset = VoxelSDFDataset(voxel_grids, num_query_points=args.num_query_points, fixed_surface_points_size=args.fixed_surface_points_size, noise_std=0.0, device=device)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
 
     # diffusion model
-    diffusion = MLPDiffusionModel(latent_dim=args.latent_dim, hidden=args.hidden_dim, time_emb_dim=args.time_emb_dim).to(device)
+    # If conditioning, infer cond_dim from dataset's conditioning channels (C_cond=8 in current SELTO processing)
+    cond_dim = 8 if args.cond else None
+    diffusion = MLPDiffusionModel(latent_dim=args.latent_dim, hidden=args.hidden_dim, time_emb_dim=args.time_emb_dim, cond_dim=cond_dim).to(device)
     optimizer = optim.Adam(diffusion.parameters(), lr=args.lr)
 
     # schedules
@@ -197,6 +224,8 @@ def train(args):
             # batch: (point_clouds:list, query_points, sdf) per VoxelSDFDataset collate
             try:
                 point_clouds = batch[0]
+                # optional conditioning tensor from collate_fn when args.cond
+                batch_cond = batch[3] if (args.cond and len(batch) >= 4) else None
             except Exception:
                 raise RuntimeError("Unexpected batch format from dataset; expected collate_fn output")
 
@@ -226,7 +255,7 @@ def train(args):
             z_t, noise = forward_process(z, t, betas, alphas_cumprod)
 
             optimizer.zero_grad()
-            predicted = diffusion(z_t, t)
+            predicted = diffusion(z_t, t, cond=batch_cond)
             loss = F.mse_loss(predicted, noise)
             loss.backward()
             optimizer.step()
@@ -271,7 +300,9 @@ def parse_args():
     parser.add_argument('--save-every', type=int, default=5)
     parser.add_argument('--out-dir', type=str, default='checkpoints_diffusion')
     parser.add_argument('--no-cuda', action='store_true', help='disable CUDA even if available')
+    parser.add_argument('--cond', action='store_true', help='use conditional diffusion')
     return parser.parse_args()
+
 
 
 if __name__ == '__main__':

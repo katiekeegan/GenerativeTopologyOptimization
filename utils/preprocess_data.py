@@ -21,9 +21,9 @@ def repair_mesh(mesh):
 
     return mesh
 class VoxelSDFDataset(Dataset):
-    def __init__(self, voxel_grids, num_query_points=1000, noise_std=0.05,
+    def __init__(self, voxel_grids, problem_information_list = None, num_query_points=1000, noise_std=0.05,
                  fixed_surface_points_size=2000, device='cpu', surface_sample_ratio=0.7,
-                 anchor='min', voxel_dims=None):
+                 anchor='min', voxel_dims=None, dataset = None):
         self.voxel_grids = voxel_grids
         self.num_query_points = num_query_points
         self.noise_std = noise_std
@@ -32,8 +32,15 @@ class VoxelSDFDataset(Dataset):
         self.surface_sample_ratio = surface_sample_ratio
         self.anchor = anchor  # 'min' | 'center' | 'max' : which corner to snap to in [-1,1]^3
 
+        self.problem_information_list = problem_information_list
+        self.dataset = dataset
+
         self.surface_data = []
         self.sdf_grids = []
+
+        # For SELTO conditioning
+        self.cond_grids = None    # will become a list of [C_cond, D, H, W] tensors
+        self.F_scale = None       # global normalization for |F|
 
         # Compute shared normalization constants
         # Determine voxel dimensions: use explicit override if provided, else infer
@@ -58,6 +65,88 @@ class VoxelSDFDataset(Dataset):
             surface_points, normals = self._precompute_surface(vg)
             self.surface_data.append((surface_points, normals))
             self.sdf_grids.append(self._get_signed_distance_grid(vg.numpy()))
+
+        if self.problem_information_list is not None:
+            assert len(self.problem_information_list) == len(self.voxel_grids), "Length of problem_information_list must match number of voxel grids"
+            if self.dataset is not None:
+                self.dataset = 'SELTO'
+            if self.dataset == 'SELTO':
+                                # ------------------------------------------------------------
+                # Assumes F_list and Ω_design_list are available in scope and
+                # each has length == len(self.voxel_grids).
+                # F_list:      list of arrays/tensors [3, D, H, W]
+                # Ω_design_list: list of arrays/tensors [1, D, H, W] or [D, H, W]
+                # ------------------------------------------------------------
+                F_list = problem_information_list[0]
+                Ω_design_list = problem_information_list[1]
+                
+                global_F_tensors = []
+                for F in F_list:
+                    F_t = torch.as_tensor(F, dtype=torch.float32)
+                    assert F_t.shape[0] == 3, f"Expected F to have 3 channels, got {F_t.shape}"
+                    # sanity check spatial dims if you want:
+                    assert F_t.shape[1:] == (D, H, W), \
+                        f"F spatial shape {F_t.shape[1:]} does not match voxel_dims {(D, H, W)}"
+                    global_F_tensors.append(F_t)
+
+                # Global normalization for F magnitude (avoid division by zero)
+                max_F_val = 0.0
+                for F_t in global_F_tensors:
+                    if F_t.numel() > 0:
+                        max_F_val = max(max_F_val, float(F_t.abs().max().item()))
+                self.F_scale = max(max_F_val, 1e-8)
+
+                self.cond_grids = []
+                eps = 1e-8
+
+                for F_t, Omega_np in zip(global_F_tensors, Ω_design_list):
+                    # Convert Ω_design to tensor, ensure shape [1, D, H, W]
+                    Omega_t = torch.as_tensor(Omega_np)
+                    if Omega_t.ndim == 3:
+                        Omega_t = Omega_t.unsqueeze(0)  # [1, D, H, W]
+                    Omega_t = Omega_t.to(torch.int16)
+                    assert Omega_t.shape[1:] == (D, H, W), \
+                        f"Ω_design spatial shape {Omega_t.shape[1:]} does not match voxel_dims {(D, H, W)}"
+
+                    # --- Process F: direction, magnitude, mask ---
+                    # |F| per voxel: [1, D, H, W]
+                    F_mag = torch.linalg.norm(F_t, dim=0, keepdim=True)  # sqrt(sum_c F_c^2)
+
+                    # Direction field: [3, D, H, W]
+                    F_dir = F_t / (F_mag + eps)
+
+                    # Normalized magnitude: [1, D, H, W]
+                    F_mag_norm = F_mag / self.F_scale
+
+                    # Load mask: where any non-zero load is applied
+                    load_mask = (F_mag > 0).to(torch.float32)  # [1, D, H, W]
+
+                    # --- Process Ω_design: one-hot masks ---
+                    # Ω_design ∈ {-1, 0, 1} in SELTO: free / void / solid
+                    design_solid = (Omega_t == 1).to(torch.float32)   # [1, D, H, W]
+                    design_void  = (Omega_t == 0).to(torch.float32)   # [1, D, H, W]
+                    design_free  = (Omega_t == -1).to(torch.float32)  # [1, D, H, W]
+
+                    # Concatenate into a conditioning grid:
+                    # Channels: [F_dir(3), F_mag_norm(1), load_mask(1),
+                    #           design_solid(1), design_void(1), design_free(1)]
+                    cond = torch.cat(
+                        [
+                            F_dir,          # 3
+                            F_mag_norm,     # 1
+                            load_mask,      # 1
+                            design_solid,   # 1
+                            design_void,    # 1
+                            design_free,    # 1
+                        ],
+                        dim=0
+                    )  # -> [C_cond=8, D, H, W]
+
+                    self.cond_grids.append(cond)
+
+                # Optionally, you could stack into a big tensor:
+                # self.cond_grids = torch.stack(self.cond_grids, dim=0)
+                # shape would be [N, C_cond, D, H, W]
 
     def _precompute_surface(self, voxel_grid):
         voxel_np = voxel_grid.numpy()
@@ -163,7 +252,11 @@ class VoxelSDFDataset(Dataset):
         # Normalize SDF by geometric scale so values are roughly in [-1,1]
         sdf_values = sdf_values / self.sdf_scale
 
-        return surface_points.to(self.device), query_points, sdf_values.to(self.device)
+        if self.cond_grids is not None:
+            cond = self.cond_grids[idx].to(self.device)
+            return surface_points.to(self.device), query_points, sdf_values.to(self.device), cond.to(self.device)
+        else:
+            return surface_points.to(self.device), query_points, sdf_values.to(self.device)
 
     def _process_to_fixed_size(self, points, normals):
         n_points = points.shape[0]
@@ -216,5 +309,17 @@ def collate_fn(batch):
     point_clouds = [item[0] for item in batch]
     query_points = torch.stack([item[1] for item in batch])
     sdf_values = torch.stack([item[2] for item in batch])
+    # If conditioning grids are present, items will have 4 elements
+    if len(batch[0]) == 4:
+        conds = torch.stack([item[3] for item in batch])  # [B, C_cond, D, H, W]
+        return point_clouds, query_points, sdf_values, conds
     return point_clouds, query_points, sdf_values
 
+def create_problem_information_lists(selto):
+    Ω_design_list = []
+    F_list = []
+    for i in range(len(selto)):
+        problem, solution = selto[i]
+        Ω_design_list.append(problem.Ω_design)
+        F_list.append(problem.F)
+    return F_list, Ω_design_list

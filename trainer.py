@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader, Dataset
 import numpy as np
 from models import *
 from utils.preprocess_data import *
-import dl4to  # now this import won't fail
+import dl4to
 from dl4to.datasets import SELTODataset
 from torch.optim.lr_scheduler import StepLR
 from torch.cuda.amp import GradScaler, autocast

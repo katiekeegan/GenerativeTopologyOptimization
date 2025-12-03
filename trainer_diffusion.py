@@ -114,58 +114,88 @@ def sinusoidal_timestep_embedding(timesteps, dim: int):
     return emb
 
 
+class ResidualMLPBlock(nn.Module):
+    def __init__(self, dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.fc2 = nn.Linear(dim, dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.act = nn.SiLU()
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.fc1(x)
+        h = self.act(self.norm1(h))
+        h = self.drop(h)
+        h = self.fc2(h)
+        h = self.norm2(h)
+        return self.act(x + h)
+
+
 class MLPDiffusionModel(nn.Module):
-    """Simple MLP that predicts noise in latent space.
-    Supports optional conditioning via a spatial grid cond: [B, C_cond, D, H, W].
-    The conditioning is pooled to a vector and concatenated to inputs.
+    """Stronger score network with residual MLP blocks, LayerNorm and SiLU.
+    Optional conditioning via pooled grid cond: [B, C_cond, D, H, W].
     """
-    def __init__(self, latent_dim: int, hidden: int = 512, time_emb_dim: int = 128, cond_dim: Optional[int] = None):
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden: int = 512,
+        time_emb_dim: int = 128,
+        cond_dim: Optional[int] = None,
+        num_blocks: int = 6,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.time_emb_dim = time_emb_dim
         self.cond_dim = cond_dim
 
+        # Time embedding MLP
         self.time_mlp = nn.Sequential(
-            nn.Linear(time_emb_dim, time_emb_dim),
-            nn.ReLU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.Linear(time_emb_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, time_emb_dim),
         )
 
         in_dim = latent_dim + time_emb_dim + (cond_dim or 0)
-        self.net = nn.Sequential(
+        self.input = nn.Sequential(
             nn.Linear(in_dim, hidden),
-            nn.ReLU(),
+            nn.LayerNorm(hidden),
+            nn.SiLU(),
+        )
+
+        self.blocks = nn.ModuleList([ResidualMLPBlock(hidden, dropout=dropout) for _ in range(num_blocks)])
+        self.output = nn.Sequential(
             nn.Linear(hidden, hidden),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(hidden, latent_dim),
         )
 
     def forward(self, x: torch.Tensor, t_embed: torch.Tensor, cond: torch.Tensor | None = None):
         # x: [B, latent_dim], t_embed: [B] real-valued (e.g., log-sigma), cond: [B, C_cond, D, H, W] or None
         t_emb = sinusoidal_timestep_embedding(t_embed, self.time_emb_dim)
-        t_emb = t_emb.to(x.device)
-        t_emb = self.time_mlp(t_emb)
+        t_emb = self.time_mlp(t_emb.to(x.device))
 
         if cond is not None:
-            # Global average pool over spatial dims -> [B, C_cond]
             if cond.dim() == 5:
                 cond_vec = cond.mean(dim=(-1, -2, -3))
             elif cond.dim() == 2:
                 cond_vec = cond
             else:
-                # Fallback: flatten last dims to vector
                 cond_vec = cond.view(cond.size(0), -1)
             cond_vec = cond_vec.to(x.device)
-            h = torch.cat([x, t_emb, cond_vec], dim=1)
+            h_in = torch.cat([x, t_emb, cond_vec], dim=1)
         else:
-            # If the network was initialized with a cond_dim, but no cond is provided,
-            # pad zeros so the input dimension matches.
             if self.cond_dim is not None and self.cond_dim > 0:
                 cond_vec = torch.zeros(x.size(0), self.cond_dim, device=x.device, dtype=x.dtype)
-                h = torch.cat([x, t_emb, cond_vec], dim=1)
+                h_in = torch.cat([x, t_emb, cond_vec], dim=1)
             else:
-                h = torch.cat([x, t_emb], dim=1)
+                h_in = torch.cat([x, t_emb], dim=1)
 
-        return self.net(h)
+        h = self.input(h_in)
+        for blk in self.blocks:
+            h = blk(h)
+        return self.output(h)
 
 
 def ve_forward_noising(z0: torch.Tensor, sigma: torch.Tensor):

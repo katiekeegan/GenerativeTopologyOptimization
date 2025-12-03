@@ -23,7 +23,7 @@ def repair_mesh(mesh):
 class VoxelSDFDataset(Dataset):
     def __init__(self, voxel_grids, problem_information_list = None, num_query_points=1000, noise_std=0.05,
                  fixed_surface_points_size=2000, device='cpu', surface_sample_ratio=0.7,
-                 anchor='min', voxel_dims=None, dataset = None):
+                 anchor='min', voxel_dims=None, dataset = None, return_problem_information = False):
         self.voxel_grids = voxel_grids
         self.num_query_points = num_query_points
         self.noise_std = noise_std
@@ -41,6 +41,8 @@ class VoxelSDFDataset(Dataset):
         # For SELTO conditioning
         self.cond_grids = None    # will become a list of [C_cond, D, H, W] tensors
         self.F_scale = None       # global normalization for |F|
+
+        self.return_problem_information = return_problem_information
 
         # Compute shared normalization constants
         # Determine voxel dimensions: use explicit override if provided, else infer
@@ -254,7 +256,13 @@ class VoxelSDFDataset(Dataset):
 
         if self.cond_grids is not None:
             cond = self.cond_grids[idx].to(self.device)
-            return surface_points.to(self.device), query_points, sdf_values.to(self.device), cond.to(self.device)
+            if self.return_problem_information:
+                # Return (pc, qp, sdf, cond, F, Ω_design)
+                F_i = torch.as_tensor(self.problem_information_list[0][idx]).to(self.device)
+                Ω_i = torch.as_tensor(self.problem_information_list[1][idx]).to(self.device)
+                return surface_points.to(self.device), query_points, sdf_values.to(self.device), cond.to(self.device), F_i, Ω_i
+            else:
+                return surface_points.to(self.device), query_points, sdf_values.to(self.device), cond.to(self.device)
         else:
             return surface_points.to(self.device), query_points, sdf_values.to(self.device)
 
@@ -306,12 +314,22 @@ def create_voxel_grids(dataset):
     return voxel_grids
 
 def collate_fn(batch):
+    """Collate samples from VoxelSDFDataset.
+
+    Returns either:
+      - (point_clouds, query_points, sdf_values, conds)
+      - (point_clouds, query_points, sdf_values, conds, F, Ω_design)
+    depending on whether the dataset was constructed with return_problem_information=True.
+    """
     point_clouds = [item[0] for item in batch]
     query_points = torch.stack([item[1] for item in batch])
     sdf_values = torch.stack([item[2] for item in batch])
-    # If conditioning grids are present, items will have 4 elements
-    if len(batch[0]) == 4:
+    if len(batch[0]) >= 4:
         conds = torch.stack([item[3] for item in batch])  # [B, C_cond, D, H, W]
+        if len(batch[0]) == 6:
+            F = torch.stack([item[4] for item in batch])
+            Ω_design = torch.stack([item[5] for item in batch])
+            return point_clouds, query_points, sdf_values, conds, F, Ω_design
         return point_clouds, query_points, sdf_values, conds
     return point_clouds, query_points, sdf_values
 

@@ -367,16 +367,37 @@ def load_checkpoint(model, optimizer, filename, device):
     return start_epoch, checkpoint.get('loss', None)
 
 def main():
-    # train_modulation_module = True
-    # Training hyperparameters
-    encoding_dim = 256
-    latent_dim = 64
+    # Single argparse parser for all hyperparameters (defaults preserved)
+    parser = argparse.ArgumentParser(description='Train modulation module (VAE + SDF) with optional SDF focus and sign losses')
+    parser.add_argument('--encoding-dim', type=int, default=256, help='Feature size produced by encoder and used by decoder conditioning vector')
+    parser.add_argument('--latent-dim', type=int, default=64, help='Compressed latent z dimension for the VAE')
+    parser.add_argument('--num-epochs', type=int, default=10000, help='Total training epochs for joint AE+SDF')
+    parser.add_argument('--learning-rate', type=float, default=1e-4, help='Optimizer learning rate')
+    parser.add_argument('--timesteps', type=int, default=1000, help='DDPM forward process timesteps (used for diffusion schedule diagnostics)')
+    parser.add_argument('--diffusion-steps', type=int, default=100, help='Placeholder for diffusion-related steps (kept for compatibility)')
+    # SDF focus weighting
+    parser.add_argument('--sdf_focus', action='store_true', help='Enable focus weighting toward SDF zero-crossing')
+    parser.add_argument('--sdf_focus_alpha', type=float, default=5.0, help='Alpha multiplier for focus bump')
+    parser.add_argument('--sdf_focus_sigma', type=float, default=0.03, help='Gaussian sigma (normalized SDF units)')
+    parser.add_argument('--sdf_focus_mode', type=str, default='gauss', choices=['gauss', 'linear', 'inv'], help='Weighting mode')
+    parser.add_argument('--sdf_focus_max_weight', type=float, default=50.0, help='Max clamp for per-point weight')
+    parser.add_argument('--no_sdf_focus_normalize', dest='sdf_focus_normalize', action='store_false', help='Disable per-sample normalization of weights')
+    parser.set_defaults(sdf_focus_normalize=True)
+    # Sign-consistency hinge loss
+    parser.add_argument('--sdf_sign_loss', action='store_true', help='Enable hinge-style sign consistency loss near SDF=0')
+    parser.add_argument('--sdf_sign_gamma', type=float, default=100.0, help='Weight for sign-consistency loss term')
+    parser.add_argument('--sdf_sign_margin', type=float, default=0.01, help='Margin used in hinge for sign loss')
+    parser.add_argument('--sdf_sign_threshold', type=float, default=0.1, help='Consider points with |sdf_gt| <= threshold for sign loss')
+    args, unknown = parser.parse_known_args()
+
+    # Assign from args (keeping default values if not provided)
+    encoding_dim = int(args.encoding_dim)
+    latent_dim = int(args.latent_dim)
+    num_epochs = int(args.num_epochs)
+    learning_rate = float(args.learning_rate)
+    timesteps = int(args.timesteps)
+    diffusion_steps = int(args.diffusion_steps)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_epochs = 10000
-    learning_rate = 1e-4
-    diffusion_steps = 100
-    # Example usage
-    timesteps = 1000
     betas = cosine_beta_schedule(timesteps).to(device)
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0).to(device)
@@ -392,53 +413,12 @@ def main():
     # Create the dataset and DataLoader
     dataset = VoxelSDFDataset(voxel_grids, num_query_points=5000,fixed_surface_points_size=10000, noise_std=0.1, device=device)
 
-    # Quick diagnostics: compute mins/maxes/means across the stored SDF grids
-    try:
-        print("Computing SDF grid statistics from VoxelSDFDataset.sdf_grids...")
-        all_mins = [float(g.min().item()) for g in dataset.sdf_grids]
-        all_maxs = [float(g.max().item()) for g in dataset.sdf_grids]
-        all_means = [float(g.mean().item()) for g in dataset.sdf_grids]
-        global_min = float(np.min(all_mins)) if len(all_mins) > 0 else float('nan')
-        global_max = float(np.max(all_maxs)) if len(all_maxs) > 0 else float('nan')
-        mean_of_means = float(np.mean(all_means)) if len(all_means) > 0 else float('nan')
-        print(f"SDF grids: count={len(all_mins)}, global_min={global_min:.6f}, global_max={global_max:.6f}, mean_of_means={mean_of_means:.6f}")
-
-        # Also show normalized stats by dataset.sdf_scale if available
-        sdf_scale = getattr(dataset, 'sdf_scale', None)
-        if sdf_scale is not None and sdf_scale != 0:
-            norm_mins = [m / float(sdf_scale) for m in all_mins]
-            norm_maxs = [M / float(sdf_scale) for M in all_maxs]
-            print(f"Normalized by sdf_scale={sdf_scale:.6f}: norm_global_min={float(np.min(norm_mins)):.6f}, norm_global_max={float(np.max(norm_maxs)):.6f}")
-    except Exception as e:
-        print(f"[trainer] Warning: failed to compute SDF grid statistics: {e}")
-
     train_dataloader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
-    # modulation_module = ModulationModule(pointnet_input_dim=3, pointnet_output_dim=256, latent_dim=128).to(device)
-    # Correct shapes: VAE input_dim == feature size produced by PointNet (encoding_dim)
-    # and VAE latent_dim == compressed z-size (latent_dim). The SDF network is
-    # conditioned on the VAE decoder output (x_recon) which has size == encoding_dim,
-    # therefore sdf_network.latent_dim should be encoding_dim (conditioning vector size).
     vae = ImprovedVAE(input_dim=encoding_dim, latent_dim=latent_dim, hidden_dim=512, num_layers=8).to(device)
     sdf_network = ImprovedSDFNetwork(input_dim=encoding_dim, latent_dim=encoding_dim, hidden_dim=128, output_dim=1, num_layers=8).to(device)
     modulation_module = ModulationModule(vae, sdf_network).to(device)
-    optimizer = torch.optim.Adam(modulation_module.parameters(), lr=1e-4)
-    # parse optional CLI args for SDF focus weighting (defaults keep original behavior)
-    parser = argparse.ArgumentParser(description='Train modulation module with optional SDF focus weighting')
-    parser.add_argument('--sdf_focus', action='store_true', help='Enable focus weighting toward SDF zero-crossing')
-    parser.add_argument('--sdf_focus_alpha', type=float, default=5.0, help='Alpha multiplier for focus bump')
-    parser.add_argument('--sdf_focus_sigma', type=float, default=0.03, help='Gaussian sigma (normalized SDF units)')
-    parser.add_argument('--sdf_focus_mode', type=str, default='gauss', choices=['gauss', 'linear', 'inv'], help='Weighting mode')
-    parser.add_argument('--sdf_focus_max_weight', type=float, default=50.0, help='Max clamp for per-point weight')
-    parser.add_argument('--no_sdf_focus_normalize', dest='sdf_focus_normalize', action='store_false', help='Disable per-sample normalization of weights')
-    parser.set_defaults(sdf_focus_normalize=True)
-    # optional sign-consistency hinge loss to encourage correct sign near interface
-    parser.add_argument('--sdf_sign_loss', action='store_true', help='Enable hinge-style sign consistency loss near SDF=0')
-    parser.add_argument('--sdf_sign_gamma', type=float, default=100.0, help='Weight for sign-consistency loss term')
-    parser.add_argument('--sdf_sign_margin', type=float, default=0.01, help='Margin used in hinge for sign loss')
-    parser.add_argument('--sdf_sign_threshold', type=float, default=0.1, help='Consider points with |sdf_gt| <= threshold for sign loss')
-    args, unknown = parser.parse_known_args()
-
-    staged_training(modulation_module, train_dataloader, device, num_epochs= num_epochs, beta_kl=1e-5,
+    optimizer = torch.optim.Adam(modulation_module.parameters(), lr=learning_rate)
+    staged_training(modulation_module, train_dataloader, device, num_epochs=num_epochs, beta_kl=1e-5,
                     sdf_focus=args.sdf_focus,
                     sdf_focus_alpha=args.sdf_focus_alpha,
                     sdf_focus_sigma=args.sdf_focus_sigma,

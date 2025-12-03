@@ -214,7 +214,10 @@ def train(args):
     # If conditioning, infer cond_dim from dataset's conditioning channels (C_cond=8 in current SELTO processing)
     cond_dim = 8 if args.cond else None
     diffusion = MLPDiffusionModel(latent_dim=args.latent_dim, hidden=args.hidden_dim, time_emb_dim=args.time_emb_dim, cond_dim=cond_dim).to(device)
-    optimizer = optim.Adam(diffusion.parameters(), lr=args.lr)
+    optimizer = optim.Adam(diffusion.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # EMA of model parameters for stability
+    ema_decay = args.ema_decay
+    ema_params = {name: p.detach().clone() for name, p in diffusion.named_parameters() if p.requires_grad}
 
     # VE schedule helpers
     sigma_from_t, embed_t_for_time = ve_sigma_schedule(args.sigma_min, args.sigma_max)
@@ -264,10 +267,20 @@ def train(args):
             predicted_score = diffusion(z_t, t_embed, cond=batch_cond)
             # Target score for VE: s* = - noise / sigma
             target_score = - noise / sigma.unsqueeze(1)
-            # Optional weighting lambda(t): sigma^2 (to balance scales). Here we use simple MSE on score.
-            loss = F.mse_loss(predicted_score, target_score)
+            # Weighting lambda(t): sigma^2 to balance scales across t
+            lambda_t = (sigma ** 2).unsqueeze(1)
+            loss = F.mse_loss(predicted_score, target_score, reduction='none')
+            loss = (loss * lambda_t).mean()
             loss.backward()
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(diffusion.parameters(), args.grad_clip)
             optimizer.step()
+
+            # Update EMA params
+            with torch.no_grad():
+                for name, p in diffusion.named_parameters():
+                    if p.requires_grad:
+                        ema_params[name].mul_(ema_decay).add_(p.detach(), alpha=1.0 - ema_decay)
 
             epoch_loss += float(loss.item())
             global_step += 1
@@ -289,6 +302,12 @@ def train(args):
             fname = os.path.join(args.out_dir, f"diffusion_epoch_{epoch+1}.pth")
             torch.save(ckpt_model, fname)
             print(f"Saved diffusion checkpoint: {fname}")
+
+            # Save EMA weights as well
+            ema_state_dict = {k: v.cpu() for k, v in ema_params.items()}
+            fname_ema = os.path.join(args.out_dir, f"diffusion_epoch_{epoch+1}_ema.pth")
+            torch.save({'ema_state_dict': ema_state_dict, 'epoch': epoch, 'loss': avg_loss}, fname_ema)
+            print(f"Saved EMA diffusion checkpoint: {fname_ema}")
 
 
 def parse_args():
@@ -312,6 +331,9 @@ def parse_args():
     parser.add_argument('--out-dir', type=str, default='checkpoints_diffusion')
     parser.add_argument('--no-cuda', action='store_true', help='disable CUDA even if available')
     parser.add_argument('--cond', action='store_true', help='use conditional diffusion')
+    parser.add_argument('--grad-clip', type=float, default=1.0)
+    parser.add_argument('--ema-decay', type=float, default=0.999)
+    parser.add_argument('--weight-decay', type=float, default=1e-4)
     return parser.parse_args()
 
 

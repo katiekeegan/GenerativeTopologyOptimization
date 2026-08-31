@@ -75,6 +75,7 @@ for idx in "${!DATASETS[@]}"; do
     if [[ "${dataset}" == "all" ]]; then
       sample_dataset="sphere_complex"
     fi
+    : > "${artifact_dir}/sample.log"
     echo "=== Sampling ${run_name} prior example ==="
     if python sample_sdf_obj.py \
       --ckpt "${CHECKPOINT_ROOT}/${run_name}/mod_last.pth" \
@@ -82,12 +83,28 @@ for idx in "${!DATASETS[@]}"; do
       --grid "${SAMPLE_GRID}" \
       --chunk-size "${SAMPLE_CHUNK_SIZE}" \
       --prior-sigma "${PRIOR_STD}" \
+      --seed "${idx}" \
       --pad-boundary \
       --repair-mesh \
-      --outfile "${artifact_dir}/prior_sample.obj" > "${artifact_dir}/sample.log" 2>&1; then
+      --outfile "${artifact_dir}/prior_sample.obj" >> "${artifact_dir}/sample.log" 2>&1; then
       echo "Sample written to ${artifact_dir}/prior_sample.obj"
     else
       echo "Sample generation failed for ${run_name}; see ${artifact_dir}/sample.log"
+    fi
+    echo "=== Sampling ${run_name} reconstruction example ==="
+    if python sample_sdf_obj.py \
+      --ckpt "${CHECKPOINT_ROOT}/${run_name}/mod_last.pth" \
+      --dataset-name "${sample_dataset}" \
+      --skip-prior-sample \
+      --save-sample \
+      --sample-idx 0 \
+      --sample-outprefix "${artifact_dir}/reconstruction" \
+      --sample-mesh-grid "${SAMPLE_GRID}" \
+      --sample-mesh-chunk "${SAMPLE_CHUNK_SIZE}" \
+      --sample-repair-mesh >> "${artifact_dir}/sample.log" 2>&1; then
+      echo "Reconstruction example written under ${artifact_dir}/reconstruction_sample0_*"
+    else
+      echo "Reconstruction example failed for ${run_name}; see ${artifact_dir}/sample.log"
     fi
   fi
 done

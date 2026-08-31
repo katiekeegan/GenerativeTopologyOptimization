@@ -301,8 +301,11 @@ SAMPLE_GRID=32
 ```
 
 For each run, the script trains the VAE/SDF modulation module from scratch,
-writes last-epoch modulation and VAE checkpoints, records per-epoch losses, and
-then attempts one VAE-prior OBJ sample using the trained modulation checkpoint.
+writes last-epoch modulation and VAE checkpoints, records per-epoch losses,
+then attempts one random VAE-prior OBJ sample and one sample-0 reconstruction
+example using the trained modulation checkpoint. The prior sample can fail
+early in training if the predicted SDF has no zero crossing; the failure is
+kept in `sample.log`.
 Override settings with environment variables:
 
 ```bash
@@ -338,6 +341,9 @@ generated_examples/<run-name>/loss_plot.svg
 generated_examples/<run-name>/train.log
 generated_examples/<run-name>/sample.log
 generated_examples/<run-name>/prior_sample.obj
+generated_examples/<run-name>/reconstruction_sample0_sdfs.npz
+generated_examples/<run-name>/reconstruction_sample0_gt.obj
+generated_examples/<run-name>/reconstruction_sample0_pred.obj
 ```
 
 `generated_examples/` is the default generated-output folder. It contains a

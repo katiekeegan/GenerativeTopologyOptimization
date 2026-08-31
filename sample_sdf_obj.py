@@ -315,8 +315,9 @@ def save_dataset_sample_sdfs(modulation_module, device, root='.', name='sphere_c
     dataset's query points, and save both the ground-truth SDF scalars and the generated SDF
     predictions to an .npz file for later analysis.
     """
-    selto = SELTODataset(root=root, name=name, train=True)
-    voxel_grids = create_voxel_grids(selto)
+    max_samples = int(sample_idx) + 1
+    selto = SELTODataset(root=root, name=name, train=True, size=max_samples)
+    voxel_grids = create_voxel_grids(selto, max_samples=max_samples)
     dataset = VoxelSDFDataset(voxel_grids, num_query_points=int(num_query_points),
                               fixed_surface_points_size=int(fixed_surface_points_size),
                               noise_std=0.0, device=device)
@@ -474,6 +475,7 @@ def main():
     parser.add_argument("--grid", type=int, default=64)
     parser.add_argument("--outfile", type=str, default="sampled_shape.obj")
     parser.add_argument("--prior-sigma", type=float, default=0.25)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--ckpt", type=str, default="checkpoints_mod/mod_last.pth")
     parser.add_argument("--dataset-name", type=str, default="sphere_complex")
     parser.add_argument("--chunk-size", type=int, default=200000, help="chunk size for SDF evaluation")
@@ -490,9 +492,13 @@ def main():
     parser.add_argument("--sample-mesh-grid", type=int, default=64, help="grid resolution for predicted sample mesh export")
     parser.add_argument("--sample-mesh-chunk", type=int, default=20000, help="chunk size when evaluating dense grid for predicted mesh")
     parser.add_argument("--sample-repair-mesh", action="store_true", help="attempt mesh repair when exporting predicted sample OBJ")
+    parser.add_argument("--skip-prior-sample", action="store_true", help="skip random-prior OBJ export and only run requested dataset-sample exports")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.seed is not None:
+        torch.manual_seed(int(args.seed))
+        np.random.seed(int(args.seed))
 
     # build models (same construction as trainer.py)
     # Ensure VAE and SDF conditioning dims match: VAE.input_dim is the feature size
@@ -528,16 +534,17 @@ def main():
         except Exception as e:
             print(f"Warning: failed to compute true-data stats: {e}")
 
-    sample_sdf_from_prior_and_save(modulation_module, device,
-                                   filename=args.outfile,
-                                   grid_resolution=int(args.grid),
-                                   prior_sigma=float(args.prior_sigma),
-                                   latent_dim=int(args.latent_dim),
-                                   chunk_size=int(args.chunk_size),
-                                   out_scale=float(args.scale),
-                                   pad_boundary=bool(args.pad_boundary),
-                                   boundary_pad_value=float(args.boundary_pad_value),
-                                   repair_mesh=bool(args.repair_mesh))
+    if not args.skip_prior_sample:
+        sample_sdf_from_prior_and_save(modulation_module, device,
+                                       filename=args.outfile,
+                                       grid_resolution=int(args.grid),
+                                       prior_sigma=float(args.prior_sigma),
+                                       latent_dim=int(args.latent_dim),
+                                       chunk_size=int(args.chunk_size),
+                                       out_scale=float(args.scale),
+                                       pad_boundary=bool(args.pad_boundary),
+                                       boundary_pad_value=float(args.boundary_pad_value),
+                                       repair_mesh=bool(args.repair_mesh))
 
     if args.save_sample:
         save_dataset_sample_sdfs(modulation_module, device,

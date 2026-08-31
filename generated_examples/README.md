@@ -12,7 +12,15 @@ loss_plot.svg
 train.log
 sample.log
 prior_sample.obj
+reconstruction_sample0_sdfs.npz
+reconstruction_sample0_gt.obj
+reconstruction_sample0_pred.obj
 ```
+
+`prior_sample.obj` is a random VAE-prior draw and can fail early in training if
+the predicted SDF does not cross zero. The reconstruction files use sample 0
+from the relevant dataset and include both the ground-truth OBJ and the model
+prediction when marching cubes succeeds.
 
 The generated files are intentionally ignored by Git. Keep only this README and
 the local ignore file in source control.

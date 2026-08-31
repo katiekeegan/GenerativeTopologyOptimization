@@ -4,15 +4,22 @@ __pycache__/
 # Ignore the 'data' folder
 data/
 
-# Ignore the 'sphere_complex' folder
+# Ignore generated/downloaded datasets
+disc_complex/
+disc_simple/
+sphere_simple/
 sphere_complex/
 utils/sphere_complex
+logs/
+mesh_exports/
+wandb/
+*.egg-info/
+.pytest_cache/
 *.obj
 *.pth
 *.out
 dl4to/
 checkpoints_vae/
 checkpoints_mod/
-*.sh 
 *.npz
 *.png

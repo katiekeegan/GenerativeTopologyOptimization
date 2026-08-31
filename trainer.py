@@ -134,7 +134,8 @@ def compute_sdf(query_points, surface_points, normals, epsilon=1e-8):
 def staged_training(modulation_module, train_dataloader, device, num_epochs =10000, beta_kl=1e-4, prior_std=0.25, lr=1e-4,
                     sdf_focus=False, sdf_focus_alpha=5.0, sdf_focus_sigma=0.03, sdf_focus_mode='gauss',
                     sdf_focus_max_weight=50.0, sdf_focus_normalize=True,
-                    sdf_sign_loss=False, sdf_sign_gamma=1.0, sdf_sign_margin=0.01, sdf_sign_threshold=0.03):
+                    sdf_sign_loss=False, sdf_sign_gamma=1.0, sdf_sign_margin=0.01, sdf_sign_threshold=0.03,
+                    checkpoint_dir="checkpoints_mod", vae_checkpoint_dir="checkpoints_vae", save_every=10):
     """
     Joint training loop that optimizes the SDF L1 loss and the VAE KL regularizer
     together. The function runs for `num_epochs` epochs.
@@ -149,8 +150,8 @@ def staged_training(modulation_module, train_dataloader, device, num_epochs =100
     optimizer = optim.Adam(modulation_module.parameters(), lr=lr)
     scaler = GradScaler()
 
-    os.makedirs("checkpoints_mod", exist_ok=True)
-    os.makedirs("checkpoints_vae", exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(vae_checkpoint_dir, exist_ok=True)
 
     print(f"Joint training for {total_epochs} epochs (SDF + beta_kl*KL). beta_kl={beta_kl}, prior_std={prior_std}")
 
@@ -268,8 +269,8 @@ def staged_training(modulation_module, train_dataloader, device, num_epochs =100
                         hinge_masked = hinge[mask]
                         if hinge_masked.numel() > 0:
                             sign_loss = hinge_masked.mean()
-                # Combined loss: SDF + beta * KL + sign term
-                loss = sdf_loss + sdf_sign_gamma * sign_loss
+                # Combined loss: SDF + beta * KL + optional sign term
+                loss = sdf_loss + beta_kl * kl + sdf_sign_gamma * sign_loss
 
                 # optionally collect recon loss for logging
                 if recon is not None and 'latent_pc' in locals():
@@ -279,7 +280,6 @@ def staged_training(modulation_module, train_dataloader, device, num_epochs =100
                         recon_loss = torch.tensor(0.0, device=loss.device)
                 else:
                     recon_loss = torch.tensor(0.0, device=loss.device)
-                    loss = loss + 0.1*recon_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -301,9 +301,9 @@ def staged_training(modulation_module, train_dataloader, device, num_epochs =100
             print(f"Epoch [{epoch + 1}/{total_epochs}] - SDF: {avg_sdf:.6f}, KL: {avg_kl:.6f}, Recon(logged): {avg_recon:.6f}, sign_loss: {epoch_sign_loss/len(train_dataloader):.6f}")
 
         # periodic checkpointing
-        if (epoch + 1) % 10 == 0:
-            save_checkpoint(modulation_module, optimizer, epoch, {'sdf': avg_sdf, 'kl': avg_kl}, os.path.join("checkpoints_mod", "mod_last.pth"))
-            save_checkpoint(modulation_module.vae, optimizer, epoch, {'recon': avg_recon, 'kl': avg_kl}, os.path.join("checkpoints_vae", "vae_last.pth"))
+        if (epoch + 1) % save_every == 0 or (epoch + 1) == total_epochs:
+            save_checkpoint(modulation_module, optimizer, epoch, {'sdf': avg_sdf, 'kl': avg_kl}, os.path.join(checkpoint_dir, "mod_last.pth"))
+            save_checkpoint(modulation_module.vae, optimizer, epoch, {'recon': avg_recon, 'kl': avg_kl}, os.path.join(vae_checkpoint_dir, "vae_last.pth"))
 
         torch.cuda.empty_cache()
 
@@ -366,6 +366,38 @@ def load_checkpoint(model, optimizer, filename, device):
     print(f"Loaded checkpoint '{filename}' (epoch {checkpoint['epoch']})")
     return start_epoch, checkpoint.get('loss', None)
 
+
+def resolve_selto_dataset_names(dataset_name):
+    names = [name.strip() for name in dataset_name.split(",") if name.strip()]
+    if len(names) == 1 and names[0].lower() in {"all", "combined", "combined_all"}:
+        return ["disc_simple", "disc_complex", "sphere_simple", "sphere_complex"]
+    return names
+
+
+def safe_run_name(dataset_name):
+    names = resolve_selto_dataset_names(dataset_name)
+    if len(names) == 4 and set(names) == {"disc_simple", "disc_complex", "sphere_simple", "sphere_complex"}:
+        return "combined_all"
+    return "_plus_".join(names)
+
+
+def load_selto_voxel_grids(dataset_name, max_samples_per_dataset=0):
+    voxel_grids = []
+    names = resolve_selto_dataset_names(dataset_name)
+    for name in names:
+        print(f"Loading SELTO dataset '{name}'...")
+        selto_size = max_samples_per_dataset if max_samples_per_dataset and max_samples_per_dataset > 0 else -1
+        selto = SELTODataset(root='.', name=name, train=True, size=selto_size)
+        print(f"SELTO dataset '{name}' loaded with {len(selto)} samples.")
+        print(f"Constructing voxel grids for '{name}'...")
+        voxel_grids.extend(create_voxel_grids(selto))
+        if max_samples_per_dataset and max_samples_per_dataset > 0:
+            print(f"Voxel grids for '{name}' constructed from {min(max_samples_per_dataset, len(selto))} samples.")
+        else:
+            print(f"Voxel grids for '{name}' constructed.")
+        torch.cuda.empty_cache()
+    return names, voxel_grids
+
 def main():
     # Single argparse parser for all hyperparameters (defaults preserved)
     parser = argparse.ArgumentParser(description='Train modulation module (VAE + SDF) with optional SDF focus and sign losses')
@@ -373,8 +405,10 @@ def main():
     parser.add_argument('--latent-dim', type=int, default=64, help='Compressed latent z dimension for the VAE')
     parser.add_argument('--num-epochs', type=int, default=10000, help='Total training epochs for joint AE+SDF')
     parser.add_argument('--learning-rate', type=float, default=1e-4, help='Optimizer learning rate')
-    parser.add_argument('--timesteps', type=int, default=1000, help='DDPM forward process timesteps (used for diffusion schedule diagnostics)')
-    parser.add_argument('--diffusion-steps', type=int, default=100, help='Placeholder for diffusion-related steps (kept for compatibility)')
+    parser.add_argument('--beta-kl', type=float, default=1e-5, help='KL regularization weight')
+    parser.add_argument('--prior-std', type=float, default=0.25, help='Standard deviation of the Gaussian VAE prior')
+    parser.add_argument('--timesteps', type=int, default=1000, help='Kept for compatibility; modulation training does not use this')
+    parser.add_argument('--diffusion-steps', type=int, default=100, help='Kept for compatibility; modulation training does not use this')
     # SDF focus weighting
     parser.add_argument('--sdf_focus', action='store_true', help='Enable focus weighting toward SDF zero-crossing')
     parser.add_argument('--sdf_focus_alpha', type=float, default=5.0, help='Alpha multiplier for focus bump')
@@ -388,6 +422,19 @@ def main():
     parser.add_argument('--sdf_sign_gamma', type=float, default=100.0, help='Weight for sign-consistency loss term')
     parser.add_argument('--sdf_sign_margin', type=float, default=0.01, help='Margin used in hinge for sign loss')
     parser.add_argument('--sdf_sign_threshold', type=float, default=0.1, help='Consider points with |sdf_gt| <= threshold for sign loss')
+    parser.add_argument('--dataset-name', type=str, default='sphere_complex',
+                        help='SELTO dataset name, comma-separated names, or all/combined_all')
+    parser.add_argument('--run-name', type=str, default=None,
+                        help='Name used for output checkpoint subdirectories; defaults from --dataset-name')
+    parser.add_argument('--checkpoint-root', type=str, default='checkpoints_mod')
+    parser.add_argument('--vae-checkpoint-root', type=str, default='checkpoints_vae')
+    parser.add_argument('--save-every', type=int, default=10)
+    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--max-samples-per-dataset', type=int, default=0,
+                        help='Maximum SELTO training samples to use from each dataset; 0 uses the full split')
+    parser.add_argument('--num-query-points', type=int, default=5000)
+    parser.add_argument('--fixed-surface-points-size', type=int, default=10000)
+    parser.add_argument('--noise-std', type=float, default=0.1)
     args, unknown = parser.parse_known_args()
 
     # Assign from args (keeping default values if not provided)
@@ -395,30 +442,26 @@ def main():
     latent_dim = int(args.latent_dim)
     num_epochs = int(args.num_epochs)
     learning_rate = float(args.learning_rate)
-    timesteps = int(args.timesteps)
-    diffusion_steps = int(args.diffusion_steps)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    betas = cosine_beta_schedule(timesteps).to(device)
-    alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0).to(device)
-    save_path = 'trained_diffusion_sdf_model.pth'
     torch.cuda.empty_cache()  # After each step
-    print("Loading SELTO dataset...")
-    selto = SELTODataset(root='.', name='sphere_complex', train=True)
-    print("SELTO dataset loaded!")
-    print("Constructing voxel grids...")
-    voxel_grids = create_voxel_grids(selto)
-    print("Voxel grids constructed!")
+    dataset_names, voxel_grids = load_selto_voxel_grids(args.dataset_name, max_samples_per_dataset=args.max_samples_per_dataset)
+    run_name = args.run_name or safe_run_name(args.dataset_name)
+    checkpoint_dir = os.path.join(args.checkpoint_root, run_name)
+    vae_checkpoint_dir = os.path.join(args.vae_checkpoint_root, run_name)
+    print(f"Training run '{run_name}' on datasets: {', '.join(dataset_names)}")
+    print(f"Modulation checkpoints: {checkpoint_dir}")
+    print(f"VAE checkpoints: {vae_checkpoint_dir}")
     torch.cuda.empty_cache()  # After each step
     # Create the dataset and DataLoader
-    dataset = VoxelSDFDataset(voxel_grids, num_query_points=5000,fixed_surface_points_size=10000, noise_std=0.1, device=device)
+    dataset = VoxelSDFDataset(voxel_grids, num_query_points=args.num_query_points, fixed_surface_points_size=args.fixed_surface_points_size, noise_std=args.noise_std, device=device)
 
-    train_dataloader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
+    train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
     vae = ImprovedVAE(input_dim=encoding_dim, latent_dim=latent_dim, hidden_dim=512, num_layers=8).to(device)
     sdf_network = ImprovedSDFNetwork(input_dim=encoding_dim, latent_dim=encoding_dim, hidden_dim=128, output_dim=1, num_layers=8).to(device)
     modulation_module = ModulationModule(vae, sdf_network).to(device)
-    optimizer = torch.optim.Adam(modulation_module.parameters(), lr=learning_rate)
-    staged_training(modulation_module, train_dataloader, device, num_epochs=num_epochs, beta_kl=1e-5,
+    staged_training(modulation_module, train_dataloader, device, num_epochs=num_epochs, beta_kl=args.beta_kl,
+                    prior_std=args.prior_std,
+                    lr=learning_rate,
                     sdf_focus=args.sdf_focus,
                     sdf_focus_alpha=args.sdf_focus_alpha,
                     sdf_focus_sigma=args.sdf_focus_sigma,
@@ -428,8 +471,12 @@ def main():
                     sdf_sign_loss=args.sdf_sign_loss,
                     sdf_sign_gamma=args.sdf_sign_gamma,
                     sdf_sign_margin=args.sdf_sign_margin,
-                    sdf_sign_threshold=args.sdf_sign_threshold)
-    torch.save(modulation_module.state_dict(), "modulation_module.pth")
+                    sdf_sign_threshold=args.sdf_sign_threshold,
+                    checkpoint_dir=checkpoint_dir,
+                    vae_checkpoint_dir=vae_checkpoint_dir,
+                    save_every=args.save_every)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    torch.save(modulation_module.state_dict(), os.path.join(checkpoint_dir, "modulation_module.pth"))
 
 if __name__ == "__main__":
     torch.cuda.empty_cache()  # After each step

@@ -97,6 +97,32 @@ def evaluate_sdf_in_chunks(sdf_network, query_points, z, chunk_size=200_000):
     sdf_flat = torch.cat(out_list, dim=0).numpy().astype(np.float32)
     return sdf_flat
 
+
+def pad_sdf_boundary_from_interior(grid, pad_value=1.0):
+    # X faces
+    interior = grid[1, :, :]
+    mag = max(pad_value, np.abs(interior).max())
+    grid[0, :, :] = np.sign(interior) * mag
+    interior = grid[-2, :, :]
+    mag = max(pad_value, np.abs(interior).max())
+    grid[-1, :, :] = np.sign(interior) * mag
+    # Y faces
+    interior = grid[:, 1, :]
+    mag = max(pad_value, np.abs(interior).max())
+    grid[:, 0, :] = np.sign(interior) * mag
+    interior = grid[:, -2, :]
+    mag = max(pad_value, np.abs(interior).max())
+    grid[:, -1, :] = np.sign(interior) * mag
+    # Z faces
+    interior = grid[:, :, 1]
+    mag = max(pad_value, np.abs(interior).max())
+    grid[:, :, 0] = np.sign(interior) * mag
+    interior = grid[:, :, -2]
+    mag = max(pad_value, np.abs(interior).max())
+    grid[:, :, -1] = np.sign(interior) * mag
+    return grid
+
+
 def sample_sdf_from_prior_and_save(modulation_module, device, filename="sampled_shape.obj",
                                    grid_resolution=128, prior_sigma=0.25, latent_dim=None,
                                    chunk_size=200_000, out_scale=1.0,
@@ -162,32 +188,8 @@ def sample_sdf_from_prior_and_save(modulation_module, device, filename="sampled_
     # from the immediately interior slice. This avoids sampling outside the trained domain while
     # ensuring the iso-surface is enclosed.
     if pad_boundary:
-        def _pad_from_interior(grid, pad_value=1.0):
-            # X faces
-            interior = grid[1, :, :]
-            mag = max(pad_value, np.abs(interior).max())
-            grid[0, :, :] = np.sign(interior) * mag
-            interior = grid[-2, :, :]
-            mag = max(pad_value, np.abs(interior).max())
-            grid[-1, :, :] = np.sign(interior) * mag
-            # Y faces
-            interior = grid[:, 1, :]
-            mag = max(pad_value, np.abs(interior).max())
-            grid[:, 0, :] = np.sign(interior) * mag
-            interior = grid[:, -2, :]
-            mag = max(pad_value, np.abs(interior).max())
-            grid[:, -1, :] = np.sign(interior) * mag
-            # Z faces
-            interior = grid[:, :, 1]
-            mag = max(pad_value, np.abs(interior).max())
-            grid[:, :, 0] = np.sign(interior) * mag
-            interior = grid[:, :, -2]
-            mag = max(pad_value, np.abs(interior).max())
-            grid[:, :, -1] = np.sign(interior) * mag
-            return grid
-
         try:
-            sdf_grid = _pad_from_interior(sdf_grid, pad_value=float(boundary_pad_value))
+            sdf_grid = pad_sdf_boundary_from_interior(sdf_grid, pad_value=float(boundary_pad_value))
             print("[sample] Applied conservative boundary padding from interior slices.")
         except Exception as e:
             print(f"[sample] warning while padding boundary: {e}")
@@ -439,7 +441,7 @@ def save_dataset_sample_sdfs(modulation_module, device, root='.', name='sphere_c
         # optional conservative padding
         if pad_boundary:
             try:
-                sdf_grid_pred = _pad_from_interior(sdf_grid_pred, pad_value=float(boundary_pad_value))
+                sdf_grid_pred = pad_sdf_boundary_from_interior(sdf_grid_pred, pad_value=float(boundary_pad_value))
             except Exception:
                 pass
         if not (sdf_grid_pred.min() < 0.0 < sdf_grid_pred.max()):
@@ -468,14 +470,15 @@ def save_dataset_sample_sdfs(modulation_module, device, root='.', name='sphere_c
 def main():
     parser = argparse.ArgumentParser(description="Sample SDF from VAE prior and export a mesh (.obj)")
     parser.add_argument("--encoding-dim", type=int, default=256)
-    parser.add_argument("--latent-dim", type=int, default=64, help="VAE input / flattened latent dimension")
+    parser.add_argument("--latent-dim", type=int, default=64, help="VAE latent dimension")
     parser.add_argument("--grid", type=int, default=64)
     parser.add_argument("--outfile", type=str, default="sampled_shape.obj")
     parser.add_argument("--prior-sigma", type=float, default=0.25)
     parser.add_argument("--ckpt", type=str, default="checkpoints_mod/mod_last.pth")
+    parser.add_argument("--dataset-name", type=str, default="sphere_complex")
     parser.add_argument("--chunk-size", type=int, default=200000, help="chunk size for SDF evaluation")
     parser.add_argument("--scale", type=float, default=1.0, help="optional output mesh scale")
-    parser.add_argument("--true-stats", default=True, help="compute and print statistics for ground-truth SDF data from the dataset")
+    parser.add_argument("--true-stats", action="store_true", help="compute and print statistics for ground-truth SDF data from the dataset")
     parser.add_argument("--pad-boundary", action="store_true", help="conservatively pad boundary voxels from adjacent interior slices to enclose the surface")
     parser.add_argument("--boundary-pad-value", type=float, default=1.0, help="minimum magnitude used when padding boundary voxels")
     parser.add_argument("--repair-mesh", action="store_true", help="attempt basic mesh repair (fill holes, remove degenerate faces) before export")
@@ -518,7 +521,7 @@ def main():
     if args.true_stats:
         try:
             print("Computing ground-truth SDF statistics from dataset (may take a little while)...")
-            stats = compute_true_sdf_stats(root='.', name='sphere_complex', device='cpu')
+            stats = compute_true_sdf_stats(root='.', name=args.dataset_name, device='cpu')
             print("Ground-truth SDF stats:")
             for k, v in stats.items():
                 print(f"  {k}: {v}")
@@ -538,7 +541,7 @@ def main():
 
     if args.save_sample:
         save_dataset_sample_sdfs(modulation_module, device,
-                                 root='.', name='sphere_complex',
+                                 root='.', name=args.dataset_name,
                                  sample_idx=int(args.sample_idx),
                                  num_query_points=int(args.sample_num_query),
                                  fixed_surface_points_size=int(args.sample_fixed_surface_size),

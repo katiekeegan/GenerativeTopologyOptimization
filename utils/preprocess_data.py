@@ -1,25 +1,18 @@
-import os
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-from scipy.ndimage import distance_transform_edt, binary_dilation
 import trimesh
 from skimage import measure
 from dl4to.datasets import SELTODataset
+from topology_format_converter import repair_mesh as repair_topology_mesh
+from topology_format_converter import signed_distance_from_density
+
 
 def repair_mesh(mesh):
-    mesh.remove_duplicate_faces()
-    mesh.remove_degenerate_faces()
-    mesh.remove_unreferenced_vertices()
-    mesh.fill_holes()
-    mesh.remove_infinite_values()
-    mesh.rezero()
+    return repair_topology_mesh(mesh)
 
-    if not mesh.is_winding_consistent:
-        mesh.fix_normals()
 
-    return mesh
 class VoxelSDFDataset(Dataset):
     def __init__(self, voxel_grids, problem_information_list = None, num_query_points=1000, noise_std=0.05,
                  fixed_surface_points_size=2000, device='cpu', surface_sample_ratio=0.7,
@@ -70,7 +63,7 @@ class VoxelSDFDataset(Dataset):
 
         if self.problem_information_list is not None:
             assert len(self.problem_information_list[0]) == len(self.voxel_grids), "Length of problem_information_list must match number of voxel grids"
-            if self.dataset is not None:
+            if self.dataset is None:
                 self.dataset = 'SELTO'
             if self.dataset == 'SELTO':
                                 # ------------------------------------------------------------
@@ -231,10 +224,7 @@ class VoxelSDFDataset(Dataset):
         return verts_np
 
     def _get_signed_distance_grid(self, voxel_np):
-        voxel_bool = voxel_np.astype(bool)
-        outside = distance_transform_edt(~voxel_bool)
-        inside = distance_transform_edt(voxel_bool)
-        sdf = outside - inside
+        sdf = signed_distance_from_density(voxel_np, threshold=0.5)
         return torch.tensor(sdf, dtype=torch.float32)
 
     def __len__(self):
@@ -304,9 +294,14 @@ class VoxelSDFDataset(Dataset):
         return query_points
 
 
-def create_voxel_grids(dataset):
+def create_voxel_grids(dataset, max_samples=None):
     voxel_grids = []
-    for model_idx in range(len(dataset)):
+    if max_samples is None or max_samples <= 0:
+        num_samples = len(dataset)
+    else:
+        num_samples = min(int(max_samples), len(dataset))
+
+    for model_idx in range(num_samples):
         problem, solution = dataset[model_idx]
         density = solution.θ.squeeze().cpu()
         voxel_grids.append(density)

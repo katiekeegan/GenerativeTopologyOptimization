@@ -41,18 +41,20 @@ def main():
     parser.add_argument('--ckpt', type=str, default='checkpoints_mod/mod_last.pth')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--sample-idx', type=int, default=0)
+    parser.add_argument('--encoding-dim', type=int, default=256)
+    parser.add_argument('--latent-dim', type=int, default=64)
+    parser.add_argument('--vae-hidden-dim', type=int, default=512)
+    parser.add_argument('--sdf-hidden-dim', type=int, default=128)
     args = parser.parse_args()
 
     device = torch.device(args.device)
     print(f"Device: {device}")
 
-    # build models (match `sample_sdf_obj.py` construction and the trained checkpoint)
-    # sample_sdf_obj used: ImprovedVAE(input_dim=latent_dim, latent_dim=encoding_dim, hidden_dim=1024, num_layers=8)
-    # and ImprovedSDFNetwork(input_dim=encoding_dim, latent_dim=latent_dim, hidden_dim=512, output_dim=1, num_layers=8)
-    encoding_dim = 128
-    latent_dim = 1024
-    vae = ImprovedVAE(input_dim=latent_dim, latent_dim=encoding_dim, hidden_dim=1024, num_layers=8).to(device)
-    sdf_network = ImprovedSDFNetwork(input_dim=encoding_dim, latent_dim=latent_dim, hidden_dim=512, output_dim=1, num_layers=8).to(device)
+    # build models (match trainer.py/sample_sdf_obj.py defaults unless overridden)
+    encoding_dim = int(args.encoding_dim)
+    latent_dim = int(args.latent_dim)
+    vae = ImprovedVAE(input_dim=encoding_dim, latent_dim=latent_dim, hidden_dim=args.vae_hidden_dim, num_layers=8).to(device)
+    sdf_network = ImprovedSDFNetwork(input_dim=encoding_dim, latent_dim=encoding_dim, hidden_dim=args.sdf_hidden_dim, output_dim=1, num_layers=8).to(device)
     modulation = ModulationModule(vae, sdf_network).to(device)
 
     # load checkpoint
@@ -101,10 +103,10 @@ def main():
 
         # try predictions conditioned on raw z_enc only if sizes match
         pred_z = None
-        if z_enc.shape[-1] == latent_dim:
+        if z_enc.shape[-1] == encoding_dim:
             pred_z = modulation.sdf_network(query_b, z_enc).cpu().numpy()
         else:
-            print(f"Skipping pred_z: encoder z size={z_enc.shape[-1]} != sdf latent_dim={latent_dim}")
+            print(f"Skipping pred_z: encoder z size={z_enc.shape[-1]} != sdf conditioning dim={encoding_dim}")
 
         # predictions conditioned on decoder(z_enc) (decoder -> x_recon-like)
         try:

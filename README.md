@@ -1,69 +1,438 @@
-# Generative Topology Optimization (Latent Diffusion + SDF)
+# Generative Topology Optimization
 
-Brief overview of the current workflow combining a VAE + SDF prediction network with a latent-space DDPM for generative shape sampling. Current workflow is entirely based on [Diffusion-SDF](https://arxiv.org/pdf/2211.13757) using the [SELTO](https://arxiv.org/pdf/2209.05098) dataset as provided through [DL4TO](https://github.com/dl4to/dl4to).
+Research code for learning generative priors over 3D topology-optimization
+designs from the SELTO dataset. SELTO is the Sample-Efficient Learned Topology
+Optimization dataset, published on Zenodo and exposed by DL4TO through
+`dl4to.datasets.SELTODataset`. The main representation in this repository is a
+signed distance field (SDF): SELTO density grids are converted to sampled
+surface point clouds and SDF query points, a VAE/SDF decoder learns the shape
+space, and a VE score model is trained over the VAE latent space.
 
-## Components
+## Repository Layout
 
-- `trainer.py`: Trains the modulation module (VAE + SDF network). The VAE learns a latent representation; the SDF network predicts signed distance values conditioned on the VAE decoder output.
-- `trainer_diffusion.py`: Trains a DDPM (diffusion model) directly in the latent space learned by the VAE (noise prediction on z).
-- `sample_sdf_obj.py`: Samples a latent vector directly from a Gaussian prior (without diffusion) and exports a mesh via SDF evaluation + marching cubes.
-- `sample_diffusion_model.py`: Performs reverse diffusion sampling to obtain a latent vector, decodes it, evaluates the SDF on a dense grid, and exports a mesh.
+- `models.py`: PointNet encoder, VAE, SDF decoder, and modulation wrapper.
+- `utils/preprocess_data.py`: DL4TO/SELTO density grid to surface points, query
+  points, normalized SDF values, and optional problem-conditioning grids.
+- `trainer.py`: trains the modulation module (`VAE + SDFNetwork`).
+- `trainer_diffusion.py`: trains a variance-exploding (VE) score model on VAE
+  latents.
+- `sample_sdf_obj.py`: samples from the VAE Gaussian prior and exports an OBJ.
+- `sample_diffusion_model.py`: samples through the trained VE score model and
+  exports an OBJ.
+- `trainer_posterior.py`: experimental RealNVP posterior training for one fixed
+  SELTO problem using a score prior and a dl4to PDE energy.
+- `topology_format_converter`: external format-conversion dependency used for
+  shared mesh repair and signed-distance grid utilities.
+- `scripts/`: diagnostics and sanity checks.
+- `dl4to/`: vendored DL4TO package used for SELTO data access and PDE solves.
 
-## Training the VAE + SDF Network
+Generated datasets, checkpoints, meshes, and W&B outputs are not part of the
+source workflow and are ignored by `.gitignore`.
+
+`utils/csvMaker.py` and `utils/objMaker.py` are legacy conversion helpers. They
+refer to local mesh/export folders and are not the canonical way to obtain
+SELTO. For this project, use DL4TO's `SELTODataset` loader.
+
+## Environment
+
+On NERSC-style systems, use the module stack from the Slurm scripts:
 
 ```bash
-python trainer.py --sdf_focus --sdf_sign_loss  # optional flags
+module load python
+module load pytorch/2.6.0
+export PYTHONPATH=dl4to:.
 ```
 
-Key flags (see script for full list):
-- `--sdf_focus`: emphasize samples near the zero-level set.
-- `--sdf_sign_loss`: hinge-style sign consistency near surface.
+Install this repository and its external converter dependency with:
+
+```bash
+pip install -e .
+```
+
+On HPC systems where core dependencies come from environment modules, install
+the converter explicitly and skip dependency resolution:
+
+```bash
+pip install -e /path/to/topology_format_converter --no-deps
+pip install -e . --no-deps
+```
+
+For an uninstalled local converter checkout, point
+`TOPOLOGY_FORMAT_CONVERTER_PATH` at that checkout before running scripts:
+
+```bash
+export TOPOLOGY_FORMAT_CONVERTER_PATH=/path/to/topology_format_converter
+export PYTHONPATH="${TOPOLOGY_FORMAT_CONVERTER_PATH}:dl4to:."
+```
+
+The code expects at least:
+
+```text
+torch
+numpy
+scipy
+pandas
+tqdm
+trimesh
+scikit-image
+requests
+```
+
+Optional mesh-repair/conversion helpers use `pymeshfix` and
+`point_cloud_utils`.
+
+## Format Converter Package
+
+This repository depends on the external `topology-format-converter` package:
+
+```bash
+git@github.com:katiekeegan/topology_format_converter.git
+```
+
+That package is dataset-agnostic. It handles general topology optimization
+volumes, signed-distance grids, SDF training caches, point clouds, VTK scalar
+grids, and meshes. SELTO/DL4TO are particular supported instances: the package
+provides dedicated adapter commands for those samples, but they are not the
+package's whole scope.
+
+After installation, use the CLI as `topology-convert`. Without installing, call
+it as a Python module:
+
+```bash
+PYTHONPATH="${TOPOLOGY_FORMAT_CONVERTER_PATH}:dl4to:." python -m topology_format_converter.cli --help
+```
+
+Supported conversions include:
+
+```text
+SELTO/DL4TO sample -> OBJ/STL/PLY mesh
+SELTO/DL4TO sample -> .npy/.npz density volume
+SELTO/DL4TO sample -> SDF training cache (.npz)
+SELTO/DL4TO sample range -> batch mesh/cache/volume/SDF export
+.npy/.npz/.pt volume -> OBJ/STL/PLY mesh
+.npy/.npz/.pt volume -> signed-distance grid (.npy/.npz)
+.npy/.npz/.pt volume -> SDF training cache (.npz)
+.npy/.npz/.pt volume -> legacy .vtk scalar grid for ParaView
+SDF training cache (.npz) -> OBJ/STL/PLY mesh
+SDF training cache (.npz) -> cache summary
+OBJ/STL/PLY mesh -> sampled point cloud (.npz/.csv/.ply)
+mesh -> mesh format supported by trimesh
+```
+
+Mesh, volume, SDF, cache, point-cloud, and VTK exports write metadata sidecars
+by default. The sidecar records source, dataset/split/index when available,
+density threshold, voxel shape, spacing, coordinate mode, and SDF sign
+convention.
+
+Python API example:
+
+```python
+from topology_format_converter import (
+    cache_to_mesh,
+    density_to_training_cache,
+    export_mesh,
+    load_selto_sample,
+    mesh_to_pointcloud,
+    save_volume,
+    save_training_cache,
+    signed_distance_from_density,
+)
+from topology_format_converter.selto import selto_sample_to_mesh
+
+sample = load_selto_sample(root=".", dataset="sphere_complex", split="train", index=0)
+mesh = selto_sample_to_mesh(sample, threshold=0.5, coordinate_mode="training")
+export_mesh(mesh, "sphere_complex_0.obj", metadata=sample.metadata)
+
+save_volume("sphere_complex_0_density.npz", sample.density)
+sdf_grid = signed_distance_from_density(sample.density, threshold=0.5)
+
+cache = density_to_training_cache(sample.density, threshold=0.5)
+save_training_cache(cache, "sphere_complex_0_cache.npz")
+
+mesh_from_cache = cache_to_mesh(cache)
+points, normals = mesh_to_pointcloud(mesh, num_points=10000)
+```
+
+CLI examples:
+
+```bash
+topology-convert selto-to-mesh \
+  --root . \
+  --dataset sphere_complex \
+  --split train \
+  --index 0 \
+  --coordinate-mode training \
+  --out sphere_complex_0.obj
+
+topology-convert selto-to-volume \
+  --root . \
+  --dataset disc_simple \
+  --index 0 \
+  --out disc_simple_0_density.npz
+
+topology-convert selto-to-cache \
+  --root . \
+  --dataset disc_simple \
+  --index 0 \
+  --num-surface-points 10000 \
+  --num-query-points 10000 \
+  --out disc_simple_0_cache.npz
+
+topology-convert volume-to-mesh density.npy \
+  --threshold 0.5 \
+  --coordinate-mode unit-box \
+  --out density.stl
+
+topology-convert volume-to-vtk density.npy \
+  --out density.vtk
+
+topology-convert mesh-to-pointcloud density.stl \
+  --num-points 10000 \
+  --out density_points.npz
+```
+
+Coordinate modes:
+
+- `voxel`: preserve voxel-index units, optionally with `--spacing DX DY DZ`.
+- `unit-box`: map each axis independently into `[-1, 1]`.
+- `training`: use the normalization convention expected by the SDF training
+  code.
+
+## Data
+
+The training scripts load the SELTO dataset through DL4TO's
+`dl4to.datasets.SELTODataset` class:
+
+```python
+SELTODataset(root=".", name="sphere_complex", train=True)
+```
+
+If the requested dataset directory is empty, DL4TO downloads the corresponding
+SELTO archive from Zenodo and converts CSV files into `.pt` samples under:
+
+```text
+<dataset-name>/train/
+<dataset-name>/test/
+```
+
+Common dataset names are:
+
+```text
+disc_simple
+disc_complex
+sphere_simple
+sphere_complex
+```
+
+The Zenodo record is `SELTO Dataset`, DOI `10.5281/zenodo.7781392`. It contains
+the four 3D topology-optimization subsets above, each split into training and
+validation/test archives. The paper reference is:
+
+```text
+Dittmer, S., Erzmann, D., Harms, H., Maass, P.
+SELTO: Sample-Efficient Learned Topology Optimization.
+arXiv:2209.05098.
+```
+
+## Training
+
+Train the VAE/SDF modulation module:
+
+```bash
+python trainer.py \
+  --dataset-name sphere_complex \
+  --num-epochs 1000 \
+  --learning-rate 1e-4 \
+  --beta-kl 1e-5 \
+  --prior-std 0.25
+```
 
 Outputs:
-- Checkpoints in `checkpoints_mod/` (modulation module) and `checkpoints_vae/`.
-- Final state dict optionally saved as `modulation_module.pth`.
 
-## Training the Latent Diffusion Model
-
-Run after you have a trained modulation (VAE+SDF) checkpoint:
-
-```bash
-python trainer_diffusion.py --ckpt checkpoints_mod/mod_last.pth --epochs 100 --batch-size 8
+```text
+checkpoints_mod/<run-name>/mod_last.pth
+checkpoints_mod/<run-name>/modulation_module.pth
+checkpoints_vae/<run-name>/vae_last.pth
 ```
 
-Important flags:
-- `--timesteps`: number of diffusion steps (default 1000).
-- `--latent-dim`: must match the latent dimension used in `trainer.py`.
-- `--dataset-name`: dataset identifier (defaults to `sphere_complex`).
+To create separate modulation/VAE checkpoints for all SELTO subsets and a
+combined run, first request an interactive GPU allocation:
+
+```bash
+salloc --nodes 1 --qos interactive --time 04:00:00 --constraint gpuhbm80g --gpus 1 --account=m5357
+```
+
+Then run:
+
+```bash
+./scripts/train_selto_checkpoints.sh
+```
+
+If `salloc` times out before Slurm grants a GPU, submit a persistent regular
+GPU batch job:
+
+```bash
+mkdir -p logs
+sbatch scripts/slurm_train_selto_checkpoints.sh
+```
+
+By default this runs one epoch and caps each SELTO subset to 256 samples so the
+command produces initial checkpoint files quickly. Override settings with
+environment variables:
+
+```bash
+EPOCHS=10 BATCH_SIZE=8 ./scripts/train_selto_checkpoints.sh
+```
+
+Use the full training split for each subset with:
+
+```bash
+MAX_SAMPLES_PER_DATASET=0 ./scripts/train_selto_checkpoints.sh
+```
+
+The script trains:
+
+```text
+disc_simple
+disc_complex
+sphere_simple
+sphere_complex
+combined_all
+```
+
+and writes:
+
+```text
+checkpoints_mod/<run-name>/mod_last.pth
+checkpoints_mod/<run-name>/modulation_module.pth
+checkpoints_vae/<run-name>/vae_last.pth
+```
+
+Train the latent VE score model:
+
+```bash
+python trainer_diffusion.py \
+  --ckpt checkpoints_mod/sphere_complex/mod_last.pth \
+  --dataset-name sphere_complex \
+  --epochs 100 \
+  --batch-size 8 \
+  --sigma-min 0.01 \
+  --sigma-max 1.0
+```
+
+For SELTO-conditioned score training, add `--cond`. Conditional checkpoints use
+an 8-channel pooled condition vector, so pass `--cond-dim 8` when sampling from
+that checkpoint.
 
 Outputs:
-- Diffusion checkpoints in `checkpoints_diffusion/` (e.g. `diffusion_epoch_50.pth`).
 
-## Sampling (Gaussian Prior vs Diffusion)
-
-Direct prior sampling (no diffusion):
-```bash
-python sample_sdf_obj.py --ckpt checkpoints_mod/mod_last.pth --grid 64 --outfile prior_sample.obj
+```text
+checkpoints_diffusion/diffusion_epoch_<N>.pth
+checkpoints_diffusion/diffusion_epoch_<N>_ema.pth
 ```
 
-Diffusion sampling (reverse DDPM in latent space):
+## Sampling
+
+Sample from the VAE Gaussian prior:
+
+```bash
+python sample_sdf_obj.py \
+  --ckpt checkpoints_mod/sphere_complex/mod_last.pth \
+  --grid 64 \
+  --outfile sampled_shape.obj
+```
+
+Sample from the trained VE score model:
+
 ```bash
 python sample_diffusion_model.py \
-	--modulation-ckpt checkpoints_mod/mod_last.pth \
-	--diffusion-ckpt checkpoints_diffusion/diffusion_epoch_50.pth \
-	--grid 64 --outfile diffusion_sample.obj --pad-boundary --repair
+  --modulation-ckpt checkpoints_mod/sphere_complex/mod_last.pth \
+  --diffusion-ckpt checkpoints_diffusion/diffusion_epoch_100.pth \
+  --grid 64 \
+  --timesteps 1000 \
+  --sigma-min 0.01 \
+  --sigma-max 1.0 \
+  --outfile sampled_diffusion_shape.obj
 ```
 
-Useful flags for `sample_diffusion_model.py`:
-- `--pad-boundary`: conservative boundary padding to enclose surface.
-- `--repair`: attempt hole filling and cleanup (trimesh + optional pymeshfix).
+If the score checkpoint was trained with `trainer_diffusion.py --cond`, add:
 
-## Folder Notes
+```bash
+--cond-dim 8
+```
 
-- `checkpoints_mod/`, `checkpoints_vae/`, `checkpoints_diffusion/`: model checkpoints.
+Useful sampling flags:
 
-## Troubleshooting
+- `--pad-boundary`: force boundary SDF values from adjacent interior slices
+  before marching cubes.
+- `--repair-mesh`: run conservative mesh cleanup before export.
+- `--true-stats`: load SELTO data and print ground-truth SDF statistics.
+- `--save-sample`: export one dataset sample's ground-truth and predicted SDFs.
 
-- Mesh not watertight: try `--pad-boundary` and higher `--grid` resolution (e.g. 96 or 128). Ensure diffusion and VAE latent dims match.
-- Empty / invalid surface (no zero crossing): verify the modulation checkpoint quality or adjust conditioning (e.g. re-train with more epochs).
-- CUDA memory issues: lower `--grid` or `--chunk-size` during sampling; reduce batch size during training.
+## Posterior Training
+
+`trainer_posterior.py` trains an unconditional RealNVP flow for one fixed SELTO
+problem. It combines:
+
+- a non-differentiable dl4to PDE stress energy, applied with a score-function
+  estimator;
+- a differentiable VE probability-flow ODE prior from the score model;
+- the flow entropy term `log q_phi(z)`.
+
+Example:
+
+```bash
+python trainer_posterior.py \
+  --modulation-ckpt checkpoints_mod/sphere_complex/mod_last.pth \
+  --diffusion-ckpt checkpoints_diffusion/diffusion_epoch_100.pth \
+  --dataset-name sphere_complex \
+  --epochs 20 \
+  --batch-size 2 \
+  --iters-per-epoch 50 \
+  --pf-steps 10
+```
+
+If loading a conditional score checkpoint, add:
+
+```bash
+--score-cond-dim 8
+```
+
+This path is computationally expensive because each iteration decodes latents to
+voxel densities and solves a PDE.
+
+## Diagnostics
+
+Run syntax/import checks:
+
+```bash
+PYTHONPATH=dl4to:. python -m py_compile \
+  models.py trainer.py trainer_diffusion.py trainer_posterior.py \
+  sample_sdf_obj.py sample_diffusion_model.py utils/preprocess_data.py
+```
+
+Check SDF coordinate conventions:
+
+```bash
+PYTHONPATH=dl4to:. python scripts/sanity_check_sdf_coords.py
+```
+
+Inspect prediction statistics for a trained modulation checkpoint:
+
+```bash
+PYTHONPATH=dl4to:. python scripts/diagnose_sdf_predictions.py \
+  --ckpt checkpoints_mod/sphere_complex/mod_last.pth \
+  --encoding-dim 256 \
+  --latent-dim 64
+```
+
+## Notes
+
+- Main defaults use `encoding_dim=256` and `latent_dim=64`.
+- The SDF decoder is conditioned on the VAE decoder output of size
+  `encoding_dim`, not on the raw VAE latent `z`.
+- The VE score model uses log-sigma time embeddings. Use the same
+  `--sigma-min` and `--sigma-max` for training, sampling, and posterior prior
+  evaluation.
+- Run scripts from the repository root or set
+  `PYTHONPATH="${TOPOLOGY_FORMAT_CONVERTER_PATH}:dl4to:."`.

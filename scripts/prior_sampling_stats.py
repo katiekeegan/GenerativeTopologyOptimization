@@ -18,16 +18,20 @@ def main():
     parser.add_argument('--grid', type=int, default=32)
     parser.add_argument('--prior-sigma', type=float, default=0.25)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--encoding-dim', type=int, default=256)
+    parser.add_argument('--latent-dim', type=int, default=64)
+    parser.add_argument('--vae-hidden-dim', type=int, default=512)
+    parser.add_argument('--sdf-hidden-dim', type=int, default=128)
     args = parser.parse_args()
 
     device = torch.device(args.device)
     print('Device:', device)
 
-    # Model construction mirroring sample_sdf_obj
-    encoding_dim = 128
-    latent_dim = 1024
-    vae = ImprovedVAE(input_dim=latent_dim, latent_dim=encoding_dim, hidden_dim=1024, num_layers=8).to(device)
-    sdf_network = ImprovedSDFNetwork(input_dim=encoding_dim, latent_dim=latent_dim, hidden_dim=512, output_dim=1, num_layers=8).to(device)
+    # Model construction mirrors trainer.py/sample_sdf_obj defaults unless overridden.
+    encoding_dim = int(args.encoding_dim)
+    latent_dim = int(args.latent_dim)
+    vae = ImprovedVAE(input_dim=encoding_dim, latent_dim=latent_dim, hidden_dim=args.vae_hidden_dim, num_layers=8).to(device)
+    sdf_network = ImprovedSDFNetwork(input_dim=encoding_dim, latent_dim=encoding_dim, hidden_dim=args.sdf_hidden_dim, output_dim=1, num_layers=8).to(device)
     modulation = ModulationModule(vae, sdf_network).to(device)
 
     if os.path.exists(args.ckpt):

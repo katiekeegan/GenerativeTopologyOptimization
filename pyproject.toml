@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "generative-topology-optimization"
+version = "0.1.0"
+description = "Research code for learning topology optimization shape priors from SELTO/DL4TO data."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "GenerativeTopologyOptimization contributors" }
+]
+dependencies = [
+  "numpy",
+  "pandas",
+  "requests",
+  "scipy",
+  "scikit-image",
+  "torch",
+  "topology-format-converter @ git+ssh://git@github.com/katiekeegan/topology_format_converter.git@main",
+  "tqdm",
+  "trimesh"
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+mesh-repair = ["pymeshfix", "point-cloud-utils"]
+
+[tool.setuptools]
+py-modules = [
+  "bayes",
+  "models",
+  "sample_diffusion_model",
+  "sample_sdf_obj",
+  "SELTO_data_exploration",
+  "trainer",
+  "trainer_diffusion",
+  "trainer_posterior"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["utils*"]
+namespaces = true
+exclude = [
+  "data*",
+  "dl4to*",
+  "disc_complex*",
+  "disc_simple*",
+  "sphere_complex*",
+  "sphere_simple*",
+  "checkpoints_*",
+  "wandb*"
+]

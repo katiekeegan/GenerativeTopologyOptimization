@@ -244,7 +244,8 @@ python trainer.py \
   --num-epochs 1000 \
   --learning-rate 1e-4 \
   --beta-kl 1e-5 \
-  --prior-std 0.25
+  --prior-std 0.25 \
+  --artifact-dir generated_examples/sphere_complex
 ```
 
 Outputs:
@@ -253,6 +254,10 @@ Outputs:
 checkpoints_mod/<run-name>/mod_last.pth
 checkpoints_mod/<run-name>/modulation_module.pth
 checkpoints_vae/<run-name>/vae_last.pth
+generated_examples/<run-name>/loss_history.csv
+generated_examples/<run-name>/loss_history.json
+generated_examples/<run-name>/loss_plot.svg
+generated_examples/<run-name>/run_config.json
 ```
 
 To create separate modulation/VAE checkpoints for all SELTO subsets and a
@@ -276,12 +281,32 @@ mkdir -p logs
 sbatch scripts/slurm_train_selto_checkpoints.sh
 ```
 
-By default this runs one epoch and caps each SELTO subset to 256 samples so the
-command produces initial checkpoint files quickly. Override settings with
-environment variables:
+By default `scripts/train_selto_checkpoints.sh` runs the longer checkpoint
+sweep requested here:
+
+```text
+EPOCHS=10
+BATCH_SIZE=8
+MAX_SAMPLES_PER_DATASET=256
+NUM_QUERY_POINTS=5000
+FIXED_SURFACE_POINTS_SIZE=10000
+NOISE_STD=0.1
+LEARNING_RATE=1e-4
+BETA_KL=1e-5
+PRIOR_STD=0.25
+SAVE_EVERY=5
+ARTIFACT_ROOT=generated_examples
+SAMPLE_AFTER_TRAIN=1
+SAMPLE_GRID=32
+```
+
+For each run, the script trains the VAE/SDF modulation module from scratch,
+writes last-epoch modulation and VAE checkpoints, records per-epoch losses, and
+then attempts one VAE-prior OBJ sample using the trained modulation checkpoint.
+Override settings with environment variables:
 
 ```bash
-EPOCHS=10 BATCH_SIZE=8 ./scripts/train_selto_checkpoints.sh
+EPOCHS=20 BATCH_SIZE=8 ./scripts/train_selto_checkpoints.sh
 ```
 
 Use the full training split for each subset with:
@@ -306,7 +331,18 @@ and writes:
 checkpoints_mod/<run-name>/mod_last.pth
 checkpoints_mod/<run-name>/modulation_module.pth
 checkpoints_vae/<run-name>/vae_last.pth
+generated_examples/<run-name>/run_config.json
+generated_examples/<run-name>/loss_history.csv
+generated_examples/<run-name>/loss_history.json
+generated_examples/<run-name>/loss_plot.svg
+generated_examples/<run-name>/train.log
+generated_examples/<run-name>/sample.log
+generated_examples/<run-name>/prior_sample.obj
 ```
+
+`generated_examples/` is the default generated-output folder. It contains a
+tracked README and local ignore file; run artifacts are present on disk after
+training but are not committed.
 
 Train the latent VE score model:
 

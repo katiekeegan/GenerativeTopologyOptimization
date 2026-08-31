@@ -13,6 +13,8 @@ import torch.nn.functional as F
 import math
 import os
 import argparse
+import csv
+import json
 torch.cuda.empty_cache()  # After each step
 
 def sdf_loss_function(sdf_pred, sdf_gt):
@@ -127,6 +129,107 @@ def compute_sdf(query_points, surface_points, normals, epsilon=1e-8):
     # 6. Final SDF [B, N]
     return (min_dist * sign).squeeze()
 
+
+def _write_loss_svg(history, filename):
+    metrics = [
+        ("sdf", "SDF", "#1f77b4"),
+        ("kl_weighted", "beta*KL", "#d62728"),
+        ("recon", "Recon", "#2ca02c"),
+        ("total", "Total", "#111111"),
+    ]
+    width, height = 760, 430
+    left, right, top, bottom = 64, 24, 42, 64
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+    epochs = [row["epoch"] for row in history]
+    values = [
+        float(row[key])
+        for key, _, _ in metrics
+        for row in history
+        if row.get(key) is not None
+    ]
+    y_min = 0.0
+    y_max = max(values) if values else 1.0
+    if y_max <= y_min:
+        y_max = 1.0
+    y_max *= 1.05
+
+    def xy(index, value):
+        x = left + (plot_w * index / max(1, len(history) - 1))
+        y = top + plot_h - ((float(value) - y_min) / (y_max - y_min) * plot_h)
+        return x, y
+
+    lines = [
+        '<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">'.format(width, height),
+        '<rect width="100%" height="100%" fill="white"/>',
+        '<text x="{0}" y="24" font-family="sans-serif" font-size="18" font-weight="700">Training Loss History</text>'.format(left),
+        '<line x1="{0}" y1="{1}" x2="{2}" y2="{1}" stroke="#333"/>'.format(left, top + plot_h, left + plot_w),
+        '<line x1="{0}" y1="{1}" x2="{0}" y2="{2}" stroke="#333"/>'.format(left, top, top + plot_h),
+    ]
+
+    for tick in range(6):
+        frac = tick / 5.0
+        y = top + plot_h - frac * plot_h
+        value = y_min + frac * (y_max - y_min)
+        lines.append('<line x1="{0}" y1="{1:.2f}" x2="{2}" y2="{1:.2f}" stroke="#e8e8e8"/>'.format(left, y, left + plot_w))
+        lines.append('<text x="{0}" y="{1:.2f}" font-family="sans-serif" font-size="11" text-anchor="end">{2:.3g}</text>'.format(left - 8, y + 4, value))
+
+    if epochs:
+        for index in sorted(set([0, len(epochs) - 1])):
+            x, _ = xy(index, 0.0)
+            lines.append('<text x="{0:.2f}" y="{1}" font-family="sans-serif" font-size="11" text-anchor="middle">{2}</text>'.format(x, height - 26, epochs[index]))
+        lines.append('<text x="{0}" y="{1}" font-family="sans-serif" font-size="12" text-anchor="middle">epoch</text>'.format(left + plot_w / 2, height - 8))
+
+    legend_x = left
+    for key, label, color in metrics:
+        lines.append('<rect x="{0}" y="{1}" width="12" height="12" fill="{2}"/>'.format(legend_x, height - 48, color))
+        lines.append('<text x="{0}" y="{1}" font-family="sans-serif" font-size="12">{2}</text>'.format(legend_x + 18, height - 38, label))
+        legend_x += 116
+        points = [xy(index, row[key]) for index, row in enumerate(history)]
+        if points:
+            point_text = " ".join("{0:.2f},{1:.2f}".format(x, y) for x, y in points)
+            lines.append('<polyline points="{0}" fill="none" stroke="{1}" stroke-width="2"/>'.format(point_text, color))
+
+    lines.append("</svg>")
+    with open(filename, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+
+
+def write_loss_artifacts(history, artifact_dir):
+    if not artifact_dir or not history:
+        return
+    os.makedirs(artifact_dir, exist_ok=True)
+    fields = ["epoch", "sdf", "kl", "kl_weighted", "recon", "sign", "mean_weight", "total"]
+    csv_path = os.path.join(artifact_dir, "loss_history.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in history:
+            writer.writerow({field: row.get(field) for field in fields})
+
+    json_path = os.path.join(artifact_dir, "loss_history.json")
+    with open(json_path, "w", encoding="utf-8") as handle:
+        json.dump(history, handle, indent=2)
+
+    _write_loss_svg(history, os.path.join(artifact_dir, "loss_plot.svg"))
+
+
+def write_run_config(args, artifact_dir, dataset_names, checkpoint_dir, vae_checkpoint_dir):
+    if not artifact_dir:
+        return
+    os.makedirs(artifact_dir, exist_ok=True)
+    config = {
+        "run_name": args.run_name or safe_run_name(args.dataset_name),
+        "dataset_name_arg": args.dataset_name,
+        "resolved_datasets": dataset_names,
+        "checkpoint_dir": checkpoint_dir,
+        "vae_checkpoint_dir": vae_checkpoint_dir,
+        "training_args": vars(args),
+    }
+    with open(os.path.join(artifact_dir, "run_config.json"), "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, sort_keys=True)
+
+
 # def staged_training(modulation_module, train_dataloader, device, num_epochs_stage_1, num_epochs_stage_2):
 #     """
 #     Full staged training pipeline.
@@ -135,7 +238,8 @@ def staged_training(modulation_module, train_dataloader, device, num_epochs =100
                     sdf_focus=False, sdf_focus_alpha=5.0, sdf_focus_sigma=0.03, sdf_focus_mode='gauss',
                     sdf_focus_max_weight=50.0, sdf_focus_normalize=True,
                     sdf_sign_loss=False, sdf_sign_gamma=1.0, sdf_sign_margin=0.01, sdf_sign_threshold=0.03,
-                    checkpoint_dir="checkpoints_mod", vae_checkpoint_dir="checkpoints_vae", save_every=10):
+                    checkpoint_dir="checkpoints_mod", vae_checkpoint_dir="checkpoints_vae", save_every=10,
+                    artifact_dir=None):
     """
     Joint training loop that optimizes the SDF L1 loss and the VAE KL regularizer
     together. The function runs for `num_epochs` epochs.
@@ -152,6 +256,7 @@ def staged_training(modulation_module, train_dataloader, device, num_epochs =100
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(vae_checkpoint_dir, exist_ok=True)
+    history = []
 
     print(f"Joint training for {total_epochs} epochs (SDF + beta_kl*KL). beta_kl={beta_kl}, prior_std={prior_std}")
 
@@ -293,19 +398,35 @@ def staged_training(modulation_module, train_dataloader, device, num_epochs =100
         avg_sdf = epoch_sdf_loss / len(train_dataloader)
         avg_kl = epoch_kl_loss / len(train_dataloader)
         avg_recon = epoch_recon_loss / len(train_dataloader)
+        avg_sign = epoch_sign_loss / len(train_dataloader)
+        avg_mean_weight = epoch_mean_weight / epoch_weight_batches if epoch_weight_batches > 0 else 1.0
+        history.append(
+            {
+                "epoch": epoch + 1,
+                "sdf": float(avg_sdf),
+                "kl": float(avg_kl),
+                "kl_weighted": float(beta_kl * avg_kl),
+                "recon": float(avg_recon),
+                "sign": float(avg_sign),
+                "mean_weight": float(avg_mean_weight),
+                "total": float(avg_sdf + beta_kl * avg_kl + sdf_sign_gamma * avg_sign),
+            }
+        )
 
         if epoch_weight_batches > 0:
-            avg_mean_weight = epoch_mean_weight / epoch_weight_batches
-            print(f"Epoch [{epoch + 1}/{total_epochs}] - SDF: {avg_sdf:.6f}, KL: {avg_kl:.6f}, Recon(logged): {avg_recon:.6f}, sign_loss: {epoch_sign_loss/len(train_dataloader):.6f}, mean_weight: {avg_mean_weight:.4f}")
+            print(f"Epoch [{epoch + 1}/{total_epochs}] - SDF: {avg_sdf:.6f}, KL: {avg_kl:.6f}, Recon(logged): {avg_recon:.6f}, sign_loss: {avg_sign:.6f}, mean_weight: {avg_mean_weight:.4f}")
         else:
-            print(f"Epoch [{epoch + 1}/{total_epochs}] - SDF: {avg_sdf:.6f}, KL: {avg_kl:.6f}, Recon(logged): {avg_recon:.6f}, sign_loss: {epoch_sign_loss/len(train_dataloader):.6f}")
+            print(f"Epoch [{epoch + 1}/{total_epochs}] - SDF: {avg_sdf:.6f}, KL: {avg_kl:.6f}, Recon(logged): {avg_recon:.6f}, sign_loss: {avg_sign:.6f}")
 
         # periodic checkpointing
         if (epoch + 1) % save_every == 0 or (epoch + 1) == total_epochs:
             save_checkpoint(modulation_module, optimizer, epoch, {'sdf': avg_sdf, 'kl': avg_kl}, os.path.join(checkpoint_dir, "mod_last.pth"))
             save_checkpoint(modulation_module.vae, optimizer, epoch, {'recon': avg_recon, 'kl': avg_kl}, os.path.join(vae_checkpoint_dir, "vae_last.pth"))
 
+        write_loss_artifacts(history, artifact_dir)
         torch.cuda.empty_cache()
+
+    return history
 
 def train_diffusion_model(diffusion_model, modulation_module, dataloader, optimizer, device, timesteps, betas, alphas_cumprod, num_epochs):
     modulation_module.eval()  # Freeze the modulation module
@@ -435,6 +556,8 @@ def main():
     parser.add_argument('--num-query-points', type=int, default=5000)
     parser.add_argument('--fixed-surface-points-size', type=int, default=10000)
     parser.add_argument('--noise-std', type=float, default=0.1)
+    parser.add_argument('--artifact-dir', type=str, default=None,
+                        help='Directory for run_config.json, loss_history.csv/json, and loss_plot.svg')
     args, unknown = parser.parse_known_args()
 
     # Assign from args (keeping default values if not provided)
@@ -451,6 +574,9 @@ def main():
     print(f"Training run '{run_name}' on datasets: {', '.join(dataset_names)}")
     print(f"Modulation checkpoints: {checkpoint_dir}")
     print(f"VAE checkpoints: {vae_checkpoint_dir}")
+    if args.artifact_dir:
+        print(f"Artifacts: {args.artifact_dir}")
+        write_run_config(args, args.artifact_dir, dataset_names, checkpoint_dir, vae_checkpoint_dir)
     torch.cuda.empty_cache()  # After each step
     # Create the dataset and DataLoader
     dataset = VoxelSDFDataset(voxel_grids, num_query_points=args.num_query_points, fixed_surface_points_size=args.fixed_surface_points_size, noise_std=args.noise_std, device=device)
@@ -474,7 +600,8 @@ def main():
                     sdf_sign_threshold=args.sdf_sign_threshold,
                     checkpoint_dir=checkpoint_dir,
                     vae_checkpoint_dir=vae_checkpoint_dir,
-                    save_every=args.save_every)
+                    save_every=args.save_every,
+                    artifact_dir=args.artifact_dir)
     os.makedirs(checkpoint_dir, exist_ok=True)
     torch.save(modulation_module.state_dict(), os.path.join(checkpoint_dir, "modulation_module.pth"))
 

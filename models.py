@@ -35,6 +35,8 @@ class PointNetEncoder(nn.Module):
 class ImprovedVAE(nn.Module):
     def __init__(self, input_dim=128, latent_dim=64, hidden_dim=256, num_layers=4):
         super(ImprovedVAE, self).__init__()
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
         
         # PointNetEncoder for surface point clouds
         self.pointnetencoder = PointNetEncoder(output_dim=input_dim)
@@ -130,13 +132,7 @@ class ImprovedSDFNetwork(nn.Module):
         self.output_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(),
-            nn.Linear(hidden_dim, 1),  # Output: [B, N, 1] (signed SDF)
-            nn.Tanh(),
-            # NOTE: removed final nn.Tanh() so output is linear (raw SDF prediction).
-            # Using a linear output avoids saturating the network into [-1,1],
-            # which can cause training plateaus when targets don't occupy the
-            # full range. Keep no activation here and let the loss steer
-            # predictions to the normalized SDF target range.
+            nn.Linear(hidden_dim, output_dim),  # Output: [B, N, output_dim] (signed SDF)
         )
 
     def forward(self, query_points, latent):

@@ -4,8 +4,8 @@ trainer_posterior.py
 ====================
 
 This script implements variational posterior training in the latent space of a
-Diffusion‑SDF model using a conditional RealNVP normalising flow and a
-score‑based prior.  It is designed to follow the framework of Feng et al.
+Diffusion‑SDF model using a single-observation RealNVP normalising flow and a
+score‑based prior. It is designed to follow the framework of Feng et al.
 "Score‑Based Priors for Bayesian Inference"【895648704979186†L273-L317】 and thus
 computes the log prior of a latent vector by integrating the probability flow
 ODE (PF‑ODE) associated with a variance‑exploding score‑based diffusion model.
@@ -23,34 +23,32 @@ Overview
    design prior.  To compute the log probability of a latent sample `z0`, we
    integrate the probability flow ODE
 
-       d z_t/dt = -0.5 * σ(t)^2 * s_θ(z_t, t),
+      d z_t/dt = -0.5 * g(t)^2 * s_θ(z_t, t),
 
-   where `σ(t)` is a variance‑exploding schedule and `s_θ` is the trained
-   score network【895648704979186†L273-L317】.  The log density is then given by
+   where `σ(t)` is a variance‑exploding schedule, `g(t)^2 = dσ(t)^2/dt`,
+   and `s_θ` is the trained score network【895648704979186†L273-L317】.
+   The log density is then given by
 
        log p_θ(z0) = log p_T(z_T) - ∫₀¹ div(f_θ(z_t, t)) dt,
 
    where `p_T` is the Gaussian at terminal variance `σ_max` and the divergence
    term is approximated with Hutchinson’s estimator【895648704979186†L273-L317】.
 
-3. **Conditional RealNVP Flow:**  We train a conditional RealNVP flow
-   `q_φ(z | cond)` to approximate the posterior distribution over latent
-   codes given problem information `cond` (e.g. forces and design masks).
-   The flow transforms base noise `w ~ N(0,I)` into latent codes `z` using a
-   sequence of affine coupling layers, each conditioned on an embedding of
-   `cond` extracted by a small 3D convolutional encoder.
+3. **RealNVP Flow:**  We train a RealNVP flow `q_φ(z)` for one fixed problem
+   observation. The flow transforms base noise `w ~ N(0,I)` into latent codes
+   `z` using a sequence of affine coupling layers.
 4. **Energy Functional:**  For each sample, we decode the latent code back to
    an SDF and compare it to the true SDF values at query points.  This
    reconstruction error defines a per‑sample energy `E(z)`; additional
    physics‑based terms (e.g. compliance) can be added here.  The total
    variational loss is
 
-       L(φ) = E(z) - log p_θ(z) + log q_φ(z | cond),
+      L(φ) = E(z) - log p_θ(z) + log q_φ(z),
 
    averaged over batches of samples from the flow.
 
-This script trains only the RealNVP parameters and the conditioning encoder; the
-VAE/SDF modules and the score network are loaded from existing checkpoints.
+This script trains only the RealNVP parameters; the VAE/SDF modules and the
+score network are loaded from existing checkpoints.
 
 """
 
@@ -98,13 +96,14 @@ def energy_functional(
     z: torch.Tensor,
     cond_grid: torch.Tensor,
     modulation_module=None,
-    grid: int = 64,
+    grid: int = 32,
     chunk_size: int = 4096,
     device: torch.device = torch.device("cpu"),
     eval_resolution: tuple = (39, 39, 21),
     problem_default = None,
     forces = None,
-    Ω_design = None
+    Ω_design = None,
+    pde_solver=None,
 ) -> torch.Tensor:
     """Return aspect-ratio-preserving voxel density grids for each sample.
 
@@ -172,15 +171,21 @@ def energy_functional(
         if problem_default is not None:
             # Work on a fresh clone to avoid in-place interference across samples
             problem_i = problem_default.clone()
-            new_design = Ω_design[i].to(device=problem_i.device, dtype=problem_i.dtype)
-            new_F = forces[i].to(device=problem_i.device, dtype=problem_i.dtype)
+            # To avoid device mismatches inside dl4to.pde, keep all PDE tensors on CPU
+            cpu = torch.device("cpu")
+            new_design = Ω_design[i].to(device=cpu, dtype=problem_i.dtype)
+            new_F = forces[i].to(device=cpu, dtype=problem_i.dtype)
             problem_i.Ω_design.copy_(new_design)
             problem_i.F.copy_(new_F)
         else:
             raise RuntimeError("problem_default must be provided")
-        problem_i.pde_solver = FDM()
+        # Reuse a preassembled PDE solver if provided
+        if pde_solver is not None:
+            problem_i.pde_solver = pde_solver
+        else:
+            problem_i.pde_solver = FDM()
         # Solution expects θ with shape [1, D, H, W]
-        θ_i = batched_density_tensor[i].unsqueeze(0)
+        θ_i = batched_density_tensor[i].unsqueeze(0).to(cpu)
         solution_i = Solution(problem_i, θ_i)
         u_i, σ_i, σ_vm_i = solution_i.solve_pde()
         von_Mises_stress_i = σ_vm_i.max() / problem_i.σ_ys
@@ -191,55 +196,37 @@ def energy_functional(
     return energy
     
 class AffineCoupling(nn.Module):
-    """Affine coupling layer as in RealNVP.
+    """Affine coupling layer as in RealNVP (unconditional).
 
     Splits the input `x` into two parts along the last dimension.  The first
     part `x_a` is passed through unchanged; the second part `x_b` is affine
     transformed according to scale and translation parameters predicted by an
-    MLP.  Both scale and translation are conditioned on an embedding of the
-    problem information.
+    MLP from `x_a` only (no conditioning).
     """
 
-    def __init__(self, in_dim: int, hidden_dim: int, cond_dim: int):
+    def __init__(self, in_dim: int, hidden_dim: int):
         super().__init__()
         self.in_dim = in_dim
         self.half = in_dim // 2
-        # MLP to predict scale and translation; doubles hidden size for scale/shift
         self.net = nn.Sequential(
-            nn.Linear(self.half + cond_dim, hidden_dim),
+            nn.Linear(self.half, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, (in_dim - self.half) * 2),
         )
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor, reverse: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward or inverse pass.
-
-        Args:
-            x: [B, in_dim]
-            cond: [B, cond_dim]
-            reverse: whether to perform the inverse transformation
-
-        Returns:
-            y: transformed tensor
-            log_det_jac: log determinant of the Jacobian of this layer
-        """
+    def forward(self, x: torch.Tensor, reverse: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         x_a, x_b = x[:, : self.half], x[:, self.half :]
-        # Condition on x_a concatenated with cond
-        h = torch.cat([x_a, cond], dim=-1)
-        # Predict scale and shift
+        h = x_a
         s_t = self.net(h)
         s, t = s_t.chunk(2, dim=-1)
-        # Constrain scale to avoid numerical issues; tanh helps bound values
         s = torch.tanh(s)
         if reverse:
-            # Inverse: x_b = (y_b - t) * exp(-s)
             y_b = (x_b - t) * torch.exp(-s)
             y_a = x_a
             log_det_jac = -torch.sum(s, dim=-1)
         else:
-            # Forward: y_b = x_b * exp(s) + t
             y_b = x_b * torch.exp(s) + t
             y_a = x_a
             log_det_jac = torch.sum(s, dim=-1)
@@ -248,93 +235,49 @@ class AffineCoupling(nn.Module):
 
 
 class RealNVP(nn.Module):
-    """A simple conditional RealNVP flow with alternating affine coupling layers and
-    random permutations.  Conditioning is provided via an external embedding of
-    the problem information (cond_emb)."""
+    """Unconditional RealNVP flow with alternating affine coupling layers and
+    random permutations (dimension reversal)."""
 
-    def __init__(self, latent_dim: int, hidden_dim: int, cond_dim: int, num_layers: int):
+    def __init__(self, latent_dim: int, hidden_dim: int, num_layers: int):
         super().__init__()
         self.latent_dim = latent_dim
         self.layers = nn.ModuleList()
-        for i in range(num_layers):
-            self.layers.append(AffineCoupling(latent_dim, hidden_dim, cond_dim))
-            # After every coupling layer, apply a permutation by reversing the order
-            # of dimensions to mix information.  This is implemented on the fly.
+        for _ in range(num_layers):
+            self.layers.append(AffineCoupling(latent_dim, hidden_dim))
 
-    def forward(self, w: torch.Tensor, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Transform base noise `w` into latent `z`.
-
-        Args:
-            w: [B, latent_dim] base samples ~ N(0, I)
-            cond: [B, cond_dim] conditioning embedding
-
-        Returns:
-            z: latent codes
-            log_det_sum: log determinant of the transformation
-        """
+    def forward(self, w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         z = w
         log_det_sum = torch.zeros(w.size(0), device=w.device)
         for i, layer in enumerate(self.layers):
-            z, log_det = layer(z, cond, reverse=False)
+            z, log_det = layer(z, reverse=False)
             log_det_sum += log_det
-            # Permutation: reverse the dimensions except on the last layer
             if i + 1 < len(self.layers):
                 z = z.flip(dims=[-1])
         return z, log_det_sum
 
-    def inverse(self, z: torch.Tensor, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Invert the flow: map latent `z` back to base noise `w`.
-
-        Args:
-            z: [B, latent_dim]
-            cond: [B, cond_dim]
-
-        Returns:
-            w: base samples
-            log_det_sum: log determinant of the inverse transformation (negative of forward)
-        """
+    def inverse(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         w = z
         log_det_sum = torch.zeros(z.size(0), device=z.device)
         for i in reversed(range(len(self.layers))):
             if i + 1 < len(self.layers):
                 w = w.flip(dims=[-1])
-            w, log_det = self.layers[i](w, cond, reverse=True)
+            w, log_det = self.layers[i](w, reverse=True)
             log_det_sum += log_det
         return w, log_det_sum
 
 
+def standard_normal_logprob(w: torch.Tensor) -> torch.Tensor:
+    return -0.5 * (w**2).sum(dim=-1) - 0.5 * w.size(-1) * math.log(2 * math.pi)
+
+
+def flow_log_prob(flow: RealNVP, z: torch.Tensor) -> torch.Tensor:
+    """Evaluate log q_phi(z) with z treated as the density-query point."""
+    w, inverse_log_det = flow.inverse(z)
+    return standard_normal_logprob(w) + inverse_log_det
+
+
 # -----------------------------------------------------------------------------
-# Conditioning Encoder
-# -----------------------------------------------------------------------------
-
-class CondEncoder3D(nn.Module):
-    """Encode the 3D conditioning grid into a small embedding vector.
-
-    Given a tensor of shape [B, C_cond, D, H, W], the encoder applies a few
-    convolutional layers followed by global average pooling to produce a vector
-    of dimension `cond_emb_dim`.  This embedding is then passed to RealNVP
-    coupling layers for conditioning.  Feel free to adjust the depth or hidden
-    sizes as needed.
-    """
-
-    def __init__(self, in_channels: int, cond_emb_dim: int):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv3d(in_channels, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv3d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv3d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool3d(1),
-        )
-        self.fc = nn.Linear(128, cond_emb_dim)
-
-    def forward(self, cond_grid: torch.Tensor) -> torch.Tensor:
-        # cond_grid: [B, C_cond, D, H, W]
-        x = self.conv(cond_grid)
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
+# Conditioning encoder removed for non-amortized (single observation) training
 
 
 # -----------------------------------------------------------------------------
@@ -354,8 +297,8 @@ def compute_log_prior_pf(
     z0: torch.Tensor,
     score_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     num_steps: int = 50,
-    sigma_min: float = 0.002,
-    sigma_max: float = 50.0,
+    sigma_min: float = 0.01,
+    sigma_max: float = 1.0,
     noise_dim: int = None,
     rtol: float = 1e-5,
 ) -> torch.Tensor:
@@ -386,6 +329,7 @@ def compute_log_prior_pf(
     logp = torch.zeros(B, device=device)
     # Precompute constant term for final Gaussian
     const_term = -0.5 * noise_dim * math.log(2 * math.pi)
+    log_sigma_ratio = math.log(float(sigma_max) / float(sigma_min))
 
     t = 0.0
     for i in range(num_steps):
@@ -395,9 +339,10 @@ def compute_log_prior_pf(
         sigma_t = default_sigma_schedule(t_curr, sigma_min, sigma_max)
         # Score: [B, d]
         with torch.enable_grad():
-            s_t = score_fn(z_t, t_curr.squeeze())
+            s_t = score_fn(z_t, t_curr.reshape(B))
         # Drift for PF‑ODE
-        drift = -0.5 * (sigma_t**2) * s_t
+        g2_t = 2.0 * log_sigma_ratio * sigma_t.pow(2)
+        drift = -0.5 * g2_t * s_t
         # Hutchinson–Skilling estimator for divergence
         v = torch.randn_like(z_t)
         v_dot_drift = (v * drift).sum()
@@ -418,12 +363,12 @@ def compute_log_prior_pf(
 # -----------------------------------------------------------------------------
 
 def train(args) -> None:
-    """Train the conditional RealNVP posterior sampler.
+    """Train the RealNVP posterior sampler for one fixed problem.
 
     This function orchestrates loading the pre‑trained VAE + SDF networks and
     score model, constructing the dataset with conditioning grids, building
-    the conditioning encoder and RealNVP flow, and optimising the variational
-    posterior using the PF‑ODE log prior.
+    the RealNVP flow, and optimising the variational posterior using the
+    PF‑ODE log prior.
     """
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     print(f"Using device: {device}")
@@ -457,16 +402,19 @@ def train(args) -> None:
     # -------------------------------------------------------------------------
     from trainer_diffusion import MLPDiffusionModel
 
-    # Initialize the score model; we'll re-instantiate with the correct cond_dim after
-    # we infer the conditioning channels from the dataset below.
-    score_model = MLPDiffusionModel(latent_dim=args.latent_dim, hidden=args.hidden_dim, time_emb_dim=args.time_emb_dim, cond_dim=0).to(device)
-    # Re-instantiate score model with cond_dim=C_cond and reload checkpoint
-    score_model = MLPDiffusionModel(latent_dim=args.latent_dim, hidden=args.hidden_dim, time_emb_dim=args.time_emb_dim, cond_dim=C_cond).to(device)
+    # The score model may have been trained with conditioning (cond_dim=8).
+    # To load such a checkpoint robustly, instantiate with cond_dim=8 and
+    # feed zeros for cond during prior evaluation.
+    # Instantiate with cond_dim=0 to match an unconditional checkpoint (input dim = latent_dim + time_emb_dim)
+    score_cond_dim = int(args.score_cond_dim) if int(args.score_cond_dim) > 0 else 0
+    score_model = MLPDiffusionModel(latent_dim=args.latent_dim, hidden=args.hidden_dim, time_emb_dim=args.time_emb_dim, cond_dim=score_cond_dim).to(device)
     if os.path.exists(args.diffusion_ckpt):
         diff_ckpt = torch.load(args.diffusion_ckpt, map_location=device)
         try:
             if isinstance(diff_ckpt, dict) and "model_state_dict" in diff_ckpt:
                 score_model.load_state_dict(diff_ckpt["model_state_dict"])
+            elif isinstance(diff_ckpt, dict) and "ema_state_dict" in diff_ckpt:
+                score_model.load_state_dict(diff_ckpt["ema_state_dict"])
             else:
                 score_model.load_state_dict(diff_ckpt)
             print(f"Loaded diffusion model from {args.diffusion_ckpt}")
@@ -474,6 +422,7 @@ def train(args) -> None:
             print(f"Failed to load diffusion checkpoint: {e}")
     else:
         print(f"Warning: diffusion checkpoint {args.diffusion_ckpt} not found. Using random init.")
+    # Freeze the score model during posterior training
     score_model.eval()
     for p in score_model.parameters():
         p.requires_grad = False
@@ -482,29 +431,27 @@ def train(args) -> None:
         """Compute the score s_θ(z_t, t) required for the PF‑ODE.
 
         Here `t` is a 1‑D tensor of size [B] representing the continuous time in
-        [0,1].  The MLPDiffusionModel expects integer timesteps, but we treat
-        the fractional value as a float; the time embedding will still map it
-        appropriately.  We call the model with `cond=None` because the prior is
-        unconditional.  The model was trained using a target of
+        [0,1]. trainer_diffusion.py passes log sigma into the time embedding, so
+        this wrapper computes log sigma(t) before calling the model. We call the
+        model with `cond=None` because the prior is unconditional. The model was
+        trained using a target of
             s_θ(z_t,t) ≈ -ε / σ(t)
         thus the output directly approximates the score.
         """
         # trainer_diffusion uses a VE-SDE with continuous time embedding via log sigma.
         # Compute log sigma(t) and pass as the time embedding; unconditional prior.
-        sigma_t = default_sigma_schedule(t.unsqueeze(0), args.sigma_min, args.sigma_max).squeeze(0)
+        t = t.reshape(-1).to(z_t.device)
+        sigma_t = default_sigma_schedule(t, args.sigma_min, args.sigma_max)
         t_embed = torch.log(sigma_t)
-    # Condition on pooled FIRST-sample cond vector (broadcast to batch)
-    cond_vec = cond_vec_first.expand(z_t.size(0), -1).contiguous()
-    return score_model(z_t, t_embed, cond=cond_vec)
+        # Unconditional prior: no conditioning vector expected by the score model
+        return score_model(z_t, t_embed, cond=None)
 
     # -------------------------------------------------------------------------
-    # Data preparation: build voxel grids, problem information lists, and dataset.
+    # Single-observation setup: fix problem, forces, and design mask
     # -------------------------------------------------------------------------
     selto = SELTODataset(root=".", name=args.dataset_name, train=True)
     voxel_grids = create_voxel_grids(selto)
-    problem, solution = selto[0]
-    # Create lists of force tensors and design masks from SELTO; this function
-    # should return two lists of length N: F_list and Omega_list
+    problem_default, _ = selto[0]
     F_list, Omega_list = create_problem_information_lists(selto)
     problem_information_list = (F_list, Omega_list)
     dataset = VoxelSDFDataset(
@@ -517,106 +464,116 @@ def train(args) -> None:
         dataset="SELTO",
         return_problem_information=True,
     )
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-
-    # Infer condition dimension from one sample; cond_grid is [B,C,D,H,W]
-    sample = next(iter(dataloader))
-    # Batch structure can be 4-tuple or 6-tuple depending on dataset settings
-    if len(sample) == 6:
-        _, _, _, cond_grid, _, _ = sample
-    elif len(sample) == 4:
-        _, _, _, cond_grid = sample
-    else:
-        raise RuntimeError("Unexpected batch structure from collate_fn")
-    if isinstance(cond_grid, list):
-        cond_grid = torch.stack(cond_grid, dim=0)
-    C_cond = cond_grid.shape[1]
-    # Pooled conditioning vector from FIRST dataset sample
-    cond_first = cond_grid[0:1]
-    cond_vec_first = cond_first.view(cond_first.size(1), -1).mean(dim=1, keepdim=True).t().to(device)
+    # Get first sample to obtain cond_grid, forces, and Ω_design; fix them
+    sample = next(iter(DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)))
+    if len(sample) != 6:
+        raise RuntimeError("collate_fn must return 6 elements: pc, qp, sdf_vals, cond, F, Ω_design")
+    _, _, _, cond_grid_1, forces_1, Omega_design_1 = sample
+    if isinstance(cond_grid_1, list):
+        cond_grid_1 = torch.stack(cond_grid_1, dim=0)
+    # cond_grid_1: [1, C, D, H, W]; forces_1: list/tensor per sample; Omega_design_1: list/tensor per sample
+    cond_grid_fixed = cond_grid_1.to(device)
+    forces_fixed = forces_1.to(device)
+    Omega_design_fixed = Omega_design_1.to(device)
 
     # -------------------------------------------------------------------------
-    # Build conditioning encoder and RealNVP flow
+    # Build unconditional RealNVP flow
     # -------------------------------------------------------------------------
-    cond_encoder = CondEncoder3D(in_channels=C_cond, cond_emb_dim=args.cond_emb_dim).to(device)
-    flow = RealNVP(latent_dim=args.latent_dim, hidden_dim=args.flow_hidden_dim, cond_dim=args.cond_emb_dim, num_layers=args.flow_num_layers).to(device)
+    flow = RealNVP(latent_dim=args.latent_dim, hidden_dim=args.flow_hidden_dim, num_layers=args.flow_num_layers).to(device)
+    optimizer = optim.Adam(list(flow.parameters()), lr=args.lr)
 
-    # Optimiser over flow + cond encoder
-    optimizer = optim.Adam(list(flow.parameters()) + list(cond_encoder.parameters()), lr=args.lr)
+    # Pre-instantiate and preassemble a single FDM solver to reuse its tensors
+    fdm_solver = FDM(padding_depth=0)
+    try:
+        fdm_solver.assemble_tensors(problem_default)
+    except Exception:
+        pass
+    energy_baseline = None
 
     # -------------------------------------------------------------------------
     # Training loop
     # -------------------------------------------------------------------------
     for epoch in range(1, args.epochs + 1):
         flow.train()
-        cond_encoder.train()
         epoch_loss = 0.0
         num_batches = 0
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
-        for batch in pbar:
-            if len(batch) != 6:
-                raise RuntimeError("collate_fn must return 6 elements: pc, qp, sdf_vals, cond, F, Ω_design")
-            point_clouds, query_points, sdf_true, cond_grid, forces, Ω_design = batch
-            # Stack point clouds to [B, N, 3]
-            if isinstance(point_clouds, list):
-                point_clouds = torch.stack(point_clouds, dim=0)
-            else:
-                point_clouds = point_clouds
-            point_clouds = point_clouds.to(device)
-            sdf_true = sdf_true.to(device)
-            if isinstance(cond_grid, list):
-                cond_grid = torch.stack(cond_grid, dim=0)
-            cond_grid = cond_grid.to(device)
-
-            # Extract latents from VAE; we ignore mu/logvar
-            with torch.no_grad():
-                z_gt = modulation_module.vae(point_clouds)
-                if isinstance(z_gt, tuple) or isinstance(z_gt, list):
-                    # according to ImprovedVAE outputs: (x_recon, z, latent_pc, mu, logvar)
-                    z_gt = z_gt[1]
-                if z_gt.dim() == 3:
-                    z_gt = z_gt.mean(dim=1)
-                z_gt = z_gt.detach()
-
-            B = z_gt.size(0)
-            # Compute cond embedding
-            cond_emb = cond_encoder(cond_grid)
-            # Sample base noise and transform to latent z
+        pbar = tqdm(range(args.iters_per_epoch), desc=f"Epoch {epoch}", leave=False)
+        for _ in pbar:
+            B = args.batch_size
+            # Sample base noise and transform to latent z (unconditional flow)
             w = torch.randn(B, args.latent_dim, device=device)
-            z, log_det = flow(w, cond_emb)
+            z, log_det = flow(w)
 
-            # Decode z to get predicted SDF at query points
-            # Use modulation module: get decoder conditioning and call SDF network
-            with torch.no_grad():
-                # decode latents via VAE decoder; returns modulation vector x_mod of shape [B, encoding_dim]
-                x_mod = modulation_module.vae.decoder(z)
-                # Ensure query points are [B, N, 3]
-                if isinstance(query_points, list):
-                    query_pts = torch.stack(query_points, dim=0)
-                else:
-                    query_pts = query_points
-                query_pts = query_pts.to(device)
-                # Predict SDF; ImprovedSDFNetwork expects latent [B, encoding_dim] and expands internally
-                sdf_pred = modulation_module.sdf_network(query_pts, x_mod)
-                
-            # Compute energy: mean squared error of SDF values
-            # energy = F.mse_loss(sdf_pred, sdf_true, reduction="none").mean(dim=-1)  # [B]
-            energy = energy_functional(z, cond_grid, modulation_module=modulation_module, device=device, problem_default=problem, forces=forces, Ω_design=Ω_design)
-            # Compute log prior via PF‑ODE; detach z_gt?  We want gradient through z
-            z_for_prior = z.detach().requires_grad_(True)
-            logp = compute_log_prior_pf(z_for_prior, score_fn, num_steps=args.pf_steps, sigma_min=args.sigma_min, sigma_max=args.sigma_max)
-            # Compute flow log prob (base density plus log det)
-            logq = -0.5 * (w**2).sum(dim=-1) - 0.5 * args.latent_dim * math.log(2 * math.pi) + log_det
-            # Loss per sample: energy - log prior + logq
-            loss = energy - logp + logq
-            # Mean over batch
+            # Compute energy functional on fixed single-observation parameters
+            # Repeat fixed tensors to match batch size
+            def repeat_batch(t: torch.Tensor, batch_size: int) -> torch.Tensor:
+                reps = (batch_size,) + (1,) * (t.dim() - 1)
+                return t.repeat(reps)
+
+            cond_grid_rep = repeat_batch(cond_grid_fixed, B)
+            forces_rep = repeat_batch(forces_fixed, B)
+            Omega_design_rep = repeat_batch(Omega_design_fixed, B)
+            # Compute energy with optional verbose timing
+            if args.verbose:
+                import time
+                t0 = time.perf_counter()
+            energy = energy_functional(
+                z,
+                cond_grid_rep,
+                modulation_module=modulation_module,
+                device=device,
+                eval_resolution=tuple(args.eval_resolution),
+                problem_default=problem_default,
+                forces=forces_rep,
+                Ω_design=Omega_design_rep,
+                pde_solver=fdm_solver,
+            )
+            if args.verbose:
+                t1 = time.perf_counter()
+                print(f"Energy/PDE time: {(t1 - t0)*1000:.2f} ms for B={B}")
+
+            # Compute log prior via PF‑ODE
+            if args.verbose:
+                import time
+                t2 = time.perf_counter()
+            logp = compute_log_prior_pf(
+                z,
+                score_fn,
+                num_steps=args.pf_steps,
+                sigma_min=args.sigma_min,
+                sigma_max=args.sigma_max,
+            )
+            if args.verbose:
+                t3 = time.perf_counter()
+                print(f"PF-ODE prior time: {(t3 - t2)*1000:.2f} ms for B={B}, steps={args.pf_steps}")
+            # Flow log prob for reparameterized entropy/KL terms.
+            logq = standard_normal_logprob(w) - log_det
+
+            # The dl4to PDE energy is non-differentiable with respect to z here:
+            # SDF evaluation is chunked through NumPy, thresholded to binary density,
+            # and solved by a CPU FDM path. Use a score-function term so lower-energy
+            # samples still update q_phi.
+            energy_detached = energy.detach()
+            batch_energy = float(energy_detached.mean().item())
+            if energy_baseline is None:
+                energy_baseline = batch_energy
+            else:
+                decay = float(args.energy_baseline_decay)
+                energy_baseline = decay * energy_baseline + (1.0 - decay) * batch_energy
+            energy_advantage = energy_detached - float(energy_baseline)
+            logq_score = flow_log_prob(flow, z.detach())
+            energy_score_loss = energy_advantage * logq_score
+
+            # Loss gradient: score-function energy term + pathwise prior/KL terms.
+            loss = energy_score_loss - logp + logq
             loss_mean = loss.mean()
+            objective_mean = (energy_detached - logp.detach() + logq.detach()).mean()
             optimizer.zero_grad()
             loss_mean.backward()
             optimizer.step()
-            epoch_loss += loss_mean.item()
+            epoch_loss += objective_mean.item()
             num_batches += 1
-            pbar.set_postfix({"loss": f"{loss_mean.item():.4f}"})
+            pbar.set_postfix({"loss": f"{loss_mean.item():.4f}", "obj": f"{objective_mean.item():.4f}"})
         avg_loss = epoch_loss / max(num_batches, 1)
         print(f"Epoch {epoch}/{args.epochs} | Avg Loss: {avg_loss:.6f}")
         # Save checkpoint periodically
@@ -626,7 +583,6 @@ def train(args) -> None:
             torch.save(
                 {
                     "flow_state_dict": flow.state_dict(),
-                    "cond_encoder_state_dict": cond_encoder.state_dict(),
                     "epoch": epoch,
                     "args": vars(args),
                 },
@@ -652,26 +608,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-dim", type=int, default=64,
                         help="Dimension of VAE latent space")
     parser.add_argument("--timesteps", type=int, default=1000,
-                        help="Number of timesteps used in score training; used to discretise continuous time")
+                        help="Kept for checkpoint metadata compatibility; PF-ODE uses --pf-steps")
     parser.add_argument("--epochs", type=int, default=100,
                         help="Number of training epochs for the posterior")
-    parser.add_argument("--batch-size", type=int, default=2,
+    parser.add_argument("--batch-size", type=int, default=1,
                         help="Batch size for posterior training")
     parser.add_argument("--lr", type=float, default=1e-4,
-                        help="Learning rate for flow and cond encoder")
+                        help="Learning rate for the RealNVP flow")
     parser.add_argument("--hidden-dim", type=int, default=512,
                         help="Hidden dimension of the score network (unused here)")
     parser.add_argument("--time-emb-dim", type=int, default=128,
                         help="Dimension of time embedding for score network")
-    parser.add_argument("--cond-emb-dim", type=int, default=128,
-                        help="Dimension of conditioning embedding for RealNVP")
+    # Remove conditioning embedding since we train per-observation (non-amortized)
     parser.add_argument("--flow-hidden-dim", type=int, default=512,
                         help="Hidden dimension in RealNVP coupling nets")
     parser.add_argument("--flow-num-layers", type=int, default=6,
                         help="Number of affine coupling layers in RealNVP")
-    parser.add_argument("--sigma-min", type=float, default=0.002,
+    parser.add_argument("--sigma-min", type=float, default=0.01,
                         help="Minimum sigma for VE SDE (PF‑ODE)")
-    parser.add_argument("--sigma-max", type=float, default=50.0,
+    parser.add_argument("--sigma-max", type=float, default=1.0,
                         help="Maximum sigma for VE SDE (PF‑ODE)")
     parser.add_argument("--pf-steps", type=int, default=50,
                         help="Number of Euler steps for PF‑ODE integration")
@@ -680,6 +635,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=str, default="checkpoints_posterior",
                         help="Output directory for posterior checkpoints")
     parser.add_argument("--no-cuda", action="store_true", help="Disable CUDA")
+    # Additional control: iterations per epoch for unconditional training loop
+    parser.add_argument("--iters-per-epoch", type=int, default=200,
+                        help="Number of optimization steps per epoch without a dataloader")
+    # Evaluation resolution for PDE grid (D H W)
+    parser.add_argument("--eval-resolution", nargs=3, type=int, default=[39, 39, 21],
+                        help="Per-axis resolution (D H W) for SDF-to-density evaluation")
+    # Verbose timing for energy/PDE and PF-ODE prior
+    parser.add_argument("--verbose", action="store_true", help="Print per-iteration timing diagnostics")
+    parser.add_argument("--score-cond-dim", type=int, default=0,
+                        help="Set to 8 when loading a score checkpoint trained with trainer_diffusion.py --cond")
+    parser.add_argument("--energy-baseline-decay", type=float, default=0.9,
+                        help="EMA decay for the score-function energy baseline")
     return parser.parse_args()
 
 

@@ -29,11 +29,9 @@ mesh-repair = ["pymeshfix", "point-cloud-utils"]
 
 [tool.setuptools]
 py-modules = [
-  "bayes",
   "models",
   "sample_diffusion_model",
   "sample_sdf_obj",
-  "SELTO_data_exploration",
   "trainer",
   "trainer_diffusion",
   "trainer_posterior"
@@ -51,5 +49,7 @@ exclude = [
   "sphere_complex*",
   "sphere_simple*",
   "checkpoints_*",
+  "generated_examples*",
+  "tmp_checkpoints_*",
   "wandb*"
 ]

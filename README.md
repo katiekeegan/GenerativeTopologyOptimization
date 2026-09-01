@@ -23,15 +23,12 @@ space, and a VE score model is trained over the VAE latent space.
   SELTO problem using a score prior and a dl4to PDE energy.
 - `topology_format_converter`: external format-conversion dependency used for
   shared mesh repair and signed-distance grid utilities.
-- `scripts/`: diagnostics and sanity checks.
-- `dl4to/`: vendored DL4TO package used for SELTO data access and PDE solves.
+- `scripts/`: maintained Slurm launchers, diagnostics, and sanity checks.
+- `generated_examples/`: tracked placeholder for ignored local run artifacts,
+  model samples, reconstructions, and loss plots.
 
 Generated datasets, checkpoints, meshes, and W&B outputs are not part of the
 source workflow and are ignored by `.gitignore`.
-
-`utils/csvMaker.py` and `utils/objMaker.py` are legacy conversion helpers. They
-refer to local mesh/export folders and are not the canonical way to obtain
-SELTO. For this project, use DL4TO's `SELTODataset` loader.
 
 ## Environment
 
@@ -42,6 +39,9 @@ module load python
 module load pytorch/2.6.0
 export PYTHONPATH=dl4to:.
 ```
+
+`dl4to/` may be an ignored local checkout, or DL4TO may be available from the
+active environment. It is not tracked in this repository.
 
 Install this repository and its external converter dependency with:
 
@@ -303,9 +303,11 @@ SAMPLE_GRID=32
 For each run, the script trains the VAE/SDF modulation module from scratch,
 writes last-epoch modulation and VAE checkpoints, records per-epoch losses,
 then attempts one random VAE-prior OBJ sample and one sample-0 reconstruction
-example using the trained modulation checkpoint. The prior sample can fail
-early in training if the predicted SDF has no zero crossing; the failure is
-kept in `sample.log`.
+example using the trained modulation checkpoint. The prior sample is the only
+output in this group that is not conditioned on a specific dataset example; the
+reconstruction files are diagnostics for an existing SELTO sample. The prior
+sample can fail early in training if the predicted SDF has no zero crossing;
+the failure is kept in `sample.log`.
 Override settings with environment variables:
 
 ```bash
@@ -448,7 +450,7 @@ voxel densities and solves a PDE.
 Run syntax/import checks:
 
 ```bash
-PYTHONPATH=dl4to:. python -m py_compile \
+PYTHONPATH="${TOPOLOGY_FORMAT_CONVERTER_PATH}:dl4to:." python -m py_compile \
   models.py trainer.py trainer_diffusion.py trainer_posterior.py \
   sample_sdf_obj.py sample_diffusion_model.py utils/preprocess_data.py
 ```
@@ -456,13 +458,13 @@ PYTHONPATH=dl4to:. python -m py_compile \
 Check SDF coordinate conventions:
 
 ```bash
-PYTHONPATH=dl4to:. python scripts/sanity_check_sdf_coords.py
+PYTHONPATH="${TOPOLOGY_FORMAT_CONVERTER_PATH}:dl4to:." python scripts/sanity_check_sdf_coords.py
 ```
 
 Inspect prediction statistics for a trained modulation checkpoint:
 
 ```bash
-PYTHONPATH=dl4to:. python scripts/diagnose_sdf_predictions.py \
+PYTHONPATH="${TOPOLOGY_FORMAT_CONVERTER_PATH}:dl4to:." python scripts/diagnose_sdf_predictions.py \
   --ckpt checkpoints_mod/sphere_complex/mod_last.pth \
   --encoding-dim 256 \
   --latent-dim 64

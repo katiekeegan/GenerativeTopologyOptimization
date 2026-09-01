@@ -1,25 +1,46 @@
-# Ignore __pycache__ folders
+# Python/cache outputs
 __pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
 
-# Ignore the 'data' folder
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Local dependency checkouts
+dl4to/
+gto_format_converter/
+
+# Downloaded/generated SELTO/DL4TO datasets
 data/
-
-# Ignore generated/downloaded datasets
 disc_complex/
 disc_simple/
 sphere_simple/
 sphere_complex/
 utils/sphere_complex
+
+# Runtime/training outputs
 logs/
 mesh_exports/
 wandb/
-*.egg-info/
-.pytest_cache/
-*.obj
-*.pth
-*.out
-dl4to/
 checkpoints_vae/
 checkpoints_mod/
+checkpoints_diffusion/
+checkpoints_posterior/
+tmp_checkpoints_vae/
+tmp_checkpoints_mod/
+generated_examples/*
+!generated_examples/.gitignore
+!generated_examples/README.md
+
+# Numeric/model/geometry artifacts
+*.obj
+*.stl
+*.ply
+*.vtk
+*.pth
+*.pt
 *.npz
+*.npy
 *.png
+*.out
